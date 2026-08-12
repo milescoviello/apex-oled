@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""apex-oled - drive the 128x40 OLED on a SteelSeries Apex Pro Gen 3.
+
+Usable as a CLI or as a library:
+
+    from importlib.machinery import SourceFileLoader
+    apex = SourceFileLoader('apex', '/path/to/apex-oled').load_module()
+    with apex.Display() as d:
+        d.text('hello', 'world')
+        d.show(some_pil_image)
+
+Protocol notes (reverse-engineered, confirmed on this keyboard 2026-08-12)
+-------------------------------------------------------------------------
+The keyboard exposes 5 HID interfaces. Interface 1 (vendor usage page 0xFFC0)
+declares a 642-byte FEATURE report - that is the screen:
+
+    642 bytes = [0x61] + 640 bytes framebuffer + [0x00]
+
+The framebuffer is 128x40 1bpp in SSD1306 *page-major* order: 5 pages of 128
+columns, one byte per column, where bit N of the byte is the pixel at
+y = page*8 + N. Plain row-major packing renders as garbage - that was the
+first thing tried and it is wrong.
+
+Delivery is a SET_REPORT control transfer, done here with the HIDIOCSFEATURE
+ioctl straight on /dev/hidrawN, so no hidapi dependency is needed. hidraw
+expects a leading report-number byte, which is 0 because this descriptor
+declares no report IDs; the kernel strips it before the transfer.
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import socket
+import sys
+import time
+
+from PIL import Image, ImageDraw, ImageFont
+
+SOCKET_PATH = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'),
+                           'apex-oledd.sock')
+
+VENDOR, PRODUCT = 0x1038, 0x1640
+WIDTH, HEIGHT = 128, 40
+PAGES = HEIGHT // 8
+FB_LEN = WIDTH * PAGES              # 640
+CMD = 0x61
+
+# Signature of the right interface: vendor page 0xFFC0 + a 642-byte feature
+# report (usage 0xF2, Report Count 0x0282).
+_DESC_PREFIX = bytes([0x06, 0xC0, 0xFF])
+_DESC_FEATURE = bytes([0x09, 0xF2, 0x96, 0x82, 0x02, 0xB1, 0x02])
+
+FONT_DIRS = ['/usr/share/fonts/dejavu']
+
+
+def _ioc(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (typ << 8) | nr
+
+
+def _hidiocsfeature(size):
+    return _ioc(3, ord('H'), 0x06, size)
+
+
+def find_device():
+    """Path of the hidraw node that carries the framebuffer, or None."""
+    for sysdir in sorted(glob.glob('/sys/class/hidraw/hidraw*')):
+        try:
+            with open(sysdir + '/device/uevent') as f:
+                uevent = f.read()
+            with open(sysdir + '/device/report_descriptor', 'rb') as f:
+                desc = f.read()
+        except OSError:
+            continue
+        if f'HID_ID=0003:{VENDOR:08X}:{PRODUCT:08X}' not in uevent.upper():
+            continue
+        if desc.startswith(_DESC_PREFIX) and _DESC_FEATURE in desc:
+            return '/dev/' + os.path.basename(sysdir)
+    return None
+
+
+_BITREV = bytes(int(format(i, '08b')[::-1], 2) for i in range(256))
+_TRANSPOSE = getattr(Image, 'Transpose', Image).TRANSPOSE
+
+
+def _to_1bit(img):
+    if img.size != (WIDTH, HEIGHT):
+        img = img.resize((WIDTH, HEIGHT), Image.LANCZOS)
+    if img.mode != '1':
+        img = img.convert('1')          # Floyd-Steinberg dither
+    return img
+
+
+def pack(img):
+    """PIL image -> 640-byte page-major framebuffer.
+
+    Accepts any mode/size; resizes and dithers to 1bpp as needed.
+
+    Done with PIL primitives rather than a per-pixel loop, since the daemon
+    renders continuously. Transposing makes each source *column* a row, so
+    PIL's own 1bpp packing does the vertical bit-packing for us: HEIGHT is 40,
+    exactly 5 bytes per transposed row, so there is no row padding to strip.
+    """
+    img = _to_1bit(img)
+    # PIL packs MSB-first (bit 7 = topmost pixel of the page); the panel wants
+    # bit 0 = topmost, so reverse the bits within every byte.
+    raw = img.transpose(_TRANSPOSE).tobytes().translate(_BITREV)
+    # raw is indexed [x*PAGES + page]; the panel wants [page*WIDTH + x].
+    return b''.join(raw[p::PAGES] for p in range(PAGES))
+
+
+def unpack(framebuffer):
+    """Inverse of pack(): a 640-byte page-major framebuffer -> 1bpp image.
+
+    Used to accept client-rendered frames over IPC, and as a round-trip check
+    on pack(). _BITREV is its own inverse, so the same table undoes it.
+    """
+    if len(framebuffer) != FB_LEN:
+        raise ValueError(f'framebuffer must be {FB_LEN} bytes, got {len(framebuffer)}')
+    raw = bytearray(FB_LEN)
+    for p in range(PAGES):
+        raw[p::PAGES] = framebuffer[p * WIDTH:(p + 1) * WIDTH]
+    img = Image.frombytes('1', (HEIGHT, WIDTH), bytes(raw).translate(_BITREV))
+    return img.transpose(_TRANSPOSE)
+
+
+def pack_reference(img):
+    """Slow, obvious version of pack(). Kept as the correctness oracle."""
+    img = _to_1bit(img)
+    px = img.load()
+    fb = bytearray(FB_LEN)
+    for page in range(PAGES):
+        base, top = page * WIDTH, page * 8
+        for x in range(WIDTH):
+            b = 0
+            for bit in range(8):
+                if px[x, top + bit]:
+                    b |= 1 << bit
+            fb[base + x] = b
+    return bytes(fb)
+
+
+def load_font(size):
+    """Truetype at `size` if Pillow has freetype, else the bundled bitmap font.
+
+    Gentoo's dev-python/pillow needs USE=truetype for the good path;
+    without it this silently falls back and `size` is ignored.
+    """
+    try:
+        for d in FONT_DIRS:
+            for name in ('DejaVuSansCondensed-Bold.ttf', 'DejaVuSans-Bold.ttf'):
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    return ImageFont.truetype(p, size), True
+    except (OSError, ImportError):
+        pass
+    return ImageFont.load_default(), False
+
+
+def render_text(lines, size=13, align='left'):
+    """Lay out a few short lines into a 128x40 frame, vertically centred."""
+    img = Image.new('1', (WIDTH, HEIGHT), 0)
+    d = ImageDraw.Draw(img)
+    font, scalable = load_font(size)
+    lines = [str(x) for x in lines if x is not None]
+    if not lines:
+        return img
+    lh = (font.getbbox('Ay')[3] + 2) if scalable else 13
+    y = max(0, (HEIGHT - lh * len(lines)) // 2)
+    for line in lines:
+        w = d.textlength(line, font=font)
+        x = {'left': 2, 'center': (WIDTH - w) // 2, 'right': WIDTH - w - 2}[align]
+        d.text((max(0, x), y), line, font=font, fill=1)
+        y += lh
+    return img
+
+
+def daemon_send(msg, timeout=2.0):
+    """Send one JSON command to apex-oledd. Returns its reply, or None.
+
+    None means no daemon is listening, in which case callers should just
+    write to the panel directly.
+    """
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCKET_PATH)
+        s.sendall((json.dumps(msg) + '\n').encode())
+        data = b''
+        while b'\n' not in data and len(data) < 65536:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode() or '{}')
+    except (OSError, ValueError):
+        return None
+    finally:
+        s.close()
+
+
+class Display:
+    """The keyboard's OLED panel."""
+
+    def __init__(self, path=None):
+        self.path = path or find_device()
+        if self.path is None:
+            raise RuntimeError(
+                'No Apex Pro Gen 3 OLED interface found - is the keyboard connected?')
+        try:
+            self.fd = os.open(self.path, os.O_WRONLY)
+        except PermissionError:
+            raise RuntimeError(
+                f'Cannot open {self.path}. Install the udev rule at '
+                '/etc/udev/rules.d/99-steelseries-apex-oled.rules, or run as root.')
+
+    def send(self, framebuffer):
+        """Push a raw 640-byte page-major framebuffer."""
+        if len(framebuffer) != FB_LEN:
+            raise ValueError(f'framebuffer must be {FB_LEN} bytes, got {len(framebuffer)}')
+        buf = bytearray(b'\x00' + bytes([CMD]) + framebuffer + b'\x00')
+        fcntl.ioctl(self.fd, _hidiocsfeature(len(buf)), buf)
+
+    def show(self, img, invert=False):
+        """Render a PIL image to the panel."""
+        if invert:
+            img = img.convert('L').point(lambda p: 255 - p)
+        self.send(pack(img))
+
+    def blank(self):
+        self.send(bytes(FB_LEN))
+
+    def text(self, *lines, size=13, align='left', invert=False):
+        """Render up to a few short lines of text, vertically centred."""
+        self.show(render_text(lines, size=size, align=align), invert=invert)
+
+    def close(self):
+        if getattr(self, 'fd', None) is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+class Sink:
+    """Where frames go: through apex-oledd if it is running, else the panel.
+
+    The daemon owns the panel and redraws every tick, so a direct write would
+    be overwritten within a frame. Routing through it as an expiring, top
+    priority "notification" is what makes the CLI usable alongside the daemon.
+    Use --direct to bypass (and fight it).
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.secs = getattr(args, 'notify', 5.0)
+        self.dpy = None
+        self.via_daemon = False
+        if not getattr(args, 'direct', False):
+            self.via_daemon = daemon_send({'cmd': 'status'}) is not None
+        if not self.via_daemon:
+            self.dpy = Display(args.device)
+
+    def show(self, img, secs=None):
+        if self.dpy is not None:
+            self.dpy.show(img, invert=self.args.invert)
+            return
+        import base64
+        daemon_send({'cmd': 'notify', 'secs': secs or self.secs,
+                     'invert': self.args.invert,
+                     'fb': base64.b64encode(pack(img)).decode()})
+
+    def lines(self, lines, secs=None):
+        self.show(render_text(lines, size=self.args.size, align=self.args.align),
+                  secs=secs)
+
+    def blank(self):
+        if self.dpy is not None:
+            self.dpy.blank()
+        else:
+            daemon_send({'cmd': 'clear'})
+
+    def close(self):
+        if self.dpy is not None:
+            self.dpy.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def cmd_text(sink, args):
+    sink.lines(args.lines)
+
+
+def cmd_image(sink, args):
+    sink.show(Image.open(args.file))
+
+
+def cmd_clear(sink, args):
+    sink.blank()
+
+
+def cmd_pipe(sink, args):
+    """Stream stdin to the panel.
+
+    lines  (default) - rolling tail, last N lines stay on screen
+    frames           - a blank line flushes the accumulated lines as one frame
+    """
+    buf = []
+    maxlines = args.lines_per_frame
+    # Outlive one update so the frame does not lapse back to the daemon
+    # between lines; a slow producer just refreshes it in time.
+    hold = max(args.notify, 30.0)
+    for raw in sys.stdin:
+        line = raw.rstrip('\n')
+        if args.mode == 'frames':
+            if line == '':
+                if buf:
+                    sink.lines(buf[:maxlines], secs=hold)
+                    buf = []
+                continue
+            buf.append(line)
+        else:
+            buf.append(line)
+            buf = buf[-maxlines:]
+            sink.lines(buf, secs=hold)
+    if args.mode == 'frames' and buf:
+        sink.lines(buf[:maxlines], secs=hold)
+
+
+def cmd_marquee(sink, args):
+    """Scroll a long string right-to-left until interrupted."""
+    font, _ = load_font(args.size)
+    probe = ImageDraw.Draw(Image.new('1', (1, 1)))
+    text = args.text + '   ' + ('' if args.once else args.text)
+    w = int(probe.textlength(text, font=font)) + WIDTH
+    strip = Image.new('1', (w, HEIGHT), 0)
+    ImageDraw.Draw(strip).text((WIDTH, (HEIGHT - args.size) // 2), text, font=font, fill=1)
+    x = 0
+    try:
+        while True:
+            sink.show(strip.crop((x, 0, x + WIDTH, HEIGHT)),
+                      secs=max(args.delay * 4, 1.0))
+            x += args.step
+            if x + WIDTH >= w:
+                if args.once:
+                    break
+                x = 0
+            time.sleep(args.delay)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_watch(sink, args):
+    """Re-run a shell command every N seconds and show its output."""
+    import subprocess
+    hold = max(args.interval * 3, 5.0)
+    try:
+        while True:
+            out = subprocess.run(args.command, shell=True, capture_output=True,
+                                 text=True).stdout.strip().splitlines()
+            sink.lines(out[:args.lines_per_frame], secs=hold)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_info(sink, args):
+    font, scalable = load_font(13)
+    status = daemon_send({'cmd': 'status'})
+    print(f'device      : {sink.dpy.path if sink.dpy else find_device()}')
+    print(f'panel       : {WIDTH}x{HEIGHT}, 1bpp, page-major (SSD1306 order)')
+    print(f'report      : {FB_LEN + 2}-byte feature report, cmd 0x{CMD:02X}')
+    print(f'truetype    : {"yes" if scalable else "NO - Pillow lacks freetype; "
+                           "run: euse -E truetype && emerge -1 dev-python/pillow"}')
+    if status:
+        print(f'daemon      : running, showing {status.get("source")!r}'
+              f'{" (blanked)" if status.get("blanked") else ""}')
+        print(f'              active sources: {", ".join(status.get("sources", []))}')
+        print('              CLI frames route through it; --direct to bypass')
+    else:
+        print('daemon      : not running (CLI writes straight to the panel)')
+
+
+def main():
+    def add_common(parser, sub=False):
+        """Shared options, accepted either before or after the subcommand.
+
+        On subparsers the defaults are SUPPRESS, so an option left off there
+        does not clobber a value already given on the main parser.
+        """
+        d = (lambda v: argparse.SUPPRESS) if sub else (lambda v: v)
+        parser.add_argument('--device', default=d(None),
+                            help='hidraw node to use (default: autodetect)')
+        parser.add_argument('--invert', action='store_true', default=d(False),
+                            help='white background')
+        parser.add_argument('--size', type=int, default=d(13),
+                            help='font size (needs Pillow truetype)')
+        parser.add_argument('--align', default=d('left'),
+                            choices=['left', 'center', 'right'])
+        parser.add_argument('--lines-per-frame', type=int, default=d(3), metavar='N')
+        parser.add_argument('--notify', type=float, default=d(5.0), metavar='SECS',
+                            help='how long a frame holds the screen when the '
+                                 'daemon is running (default 5)')
+        parser.add_argument('--direct', action='store_true', default=d(False),
+                            help='write straight to the panel, bypassing the '
+                                 'daemon (they will fight over it)')
+
+    p = argparse.ArgumentParser(
+        prog='apex-oled',
+        description='Drive the OLED on a SteelSeries Apex Pro Gen 3.')
+    add_common(p)
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    def add(name, help, func):
+        s = sub.add_parser(name, help=help)
+        add_common(s, sub=True)
+        s.set_defaults(func=func)
+        return s
+
+    add('text', 'show one or more lines', cmd_text).add_argument('lines', nargs='+')
+
+    add('image', 'show an image file (dithered)', cmd_image).add_argument('file')
+
+    add('clear', 'blank the screen', cmd_clear)
+
+    add('pipe', 'stream stdin to the screen', cmd_pipe).add_argument(
+        '--mode', default='lines', choices=['lines', 'frames'])
+
+    s = add('marquee', 'scroll long text', cmd_marquee)
+    s.add_argument('text')
+    s.add_argument('--delay', type=float, default=0.03)
+    s.add_argument('--step', type=int, default=2)
+    s.add_argument('--once', action='store_true')
+
+    s = add('watch', 'repeatedly run a command and show its output', cmd_watch)
+    s.add_argument('command')
+    s.add_argument('--interval', type=float, default=2.0)
+
+    add('info', 'report device and capabilities', cmd_info)
+
+    args = p.parse_args()
+    try:
+        with Sink(args) as sink:
+            args.func(sink, args)
+    except RuntimeError as e:
+        sys.exit(f'apex-oled: {e}')
+
+
+if __name__ == '__main__':
+    main()

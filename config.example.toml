@@ -1,0 +1,61 @@
+# apex-oledd configuration.
+# Everything here matches the built-in defaults; edit and restart the daemon:
+#   pkill -f '[a]pex-oledd' ; apex-oledd-supervise &
+# Unset keys fall back to the defaults in apex-oledd's DEFAULTS dict.
+
+[display]
+# Blank the panel when the session locks. This is burn-in protection: the
+# idle screen is largely static, and an OLED showing the same pixels for
+# years will ghost them.
+blank_on_lock = true
+# Also blank when logind reports the session idle (not just locked).
+blank_on_idle = false
+# The whole frame walks a slow orbit this many pixels across, so no pixel is
+# lit continuously. Set 0 to disable. Sources keep a 2px margin for it.
+burnin_shift = 2
+burnin_period = 611.0
+
+[fonts]
+# condensed | condensed-bold | sans | mono
+family = "condensed"
+# ui_size 10 gives a 13px line height, which is what makes three rows fit in
+# 40px. Going bigger clips the bottom row - row_steps() compensates, but the
+# rows get cramped.
+ui_size = 10
+lyric_size = 12
+small_size = 9
+
+[idle]
+# Two capacity bars across the top. Choose from: ram, vram, swap, disk
+bars = ["ram", "vram"]
+
+[lyrics]
+# The now-playing card (cover + title + artist) is the fallback whenever there
+# is no lyric worth showing: no synced lyrics, a gap between lines, or paused.
+album_art = true
+# How a cover is reduced to 1 bit: otsu | threshold | dither | equalize | auto.
+# A fixed cutoff renders any uniformly dark or bright cover blank - that was
+# 42 of 104 covers here. otsu picks the cutoff from each image's own
+# histogram (42 -> 27 blank); auto renders every candidate and keeps the
+# best-scoring one (-> 26). Covers are also sharpened before conversion,
+# because downscaling to 34px destroys the edges 1-bit output depends on.
+art_mode = "auto"
+art_size = 34
+# After pausing, hold the card this long, then hand over to the monitoring
+# screen. Timed from the pause itself, not from the state file's timestamp.
+pause_hold = 15.0
+# Show the card instead of a stale lyric when there is this much empty space
+# on BOTH sides of the current line - intro, instrumental break, or outro.
+# Large enough that a slow song's normal line spacing never triggers it.
+gap_seconds = 8.0
+
+[game]
+# The game HUD activates while gamemode is running (gamemoded -s).
+enabled = true
+
+[sources]
+# Priority: the highest-numbered active source owns the screen.
+notify = 100
+game = 30
+lyrics = 20
+idle = 0

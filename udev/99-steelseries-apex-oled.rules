@@ -1,0 +1,5 @@
+# SteelSeries Apex Pro Gen 3 - let the logged-in user drive the OLED via hidraw.
+# Interface 1 (vendor usage page 0xFFC0) carries the 642-byte framebuffer
+# feature report. Matching the parent USB device covers all its hidraw nodes;
+# the normal keyboard input path is unaffected.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1640", MODE="0660", GROUP="input", TAG+="uaccess"

@@ -1,0 +1,50 @@
+#!/bin/bash
+# apex-oledd-supervise - keep the OLED daemon running across crashes.
+#
+# KDE autostart runs a program once; if it dies, the panel just stops updating
+# and nothing says so. This wrapper restarts it, but gives up on a crash loop
+# rather than spinning forever.
+#
+# Exit codes from apex-oledd:
+#   0  clean stop (SIGTERM/SIGINT)  -> do not restart
+#   3  another instance owns the panel -> do not restart
+#   *  crash -> restart after a delay
+
+set -u
+DAEMON="$(dirname "$(readlink -f "$0")")/apex-oledd"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+LOG="$STATE_DIR/apex-oledd.log"
+mkdir -p "$STATE_DIR"
+
+# Keep the log from growing without bound across reboots.
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    mv -f "$LOG" "$LOG.1"
+fi
+exec >>"$LOG" 2>&1
+
+fails=0
+window=$(( $(date +%s) ))
+
+while true; do
+    echo "--- starting apex-oledd at $(date -Is)"
+    "$DAEMON" -v "$@"
+    code=$?
+
+    case "$code" in
+        0) echo "--- clean exit at $(date -Is)"; exit 0 ;;
+        3) echo "--- another instance owns the panel; exiting"; exit 0 ;;
+    esac
+
+    now=$(date +%s)
+    if [ $(( now - window )) -gt 300 ]; then   # fresh 5 min window
+        fails=0
+        window=$now
+    fi
+    fails=$(( fails + 1 ))
+    if [ "$fails" -ge 5 ]; then
+        echo "--- exited $code five times in under 5 minutes; giving up"
+        exit 1
+    fi
+    echo "--- exited $code; restarting in 5s (failure $fails/5)"
+    sleep 5
+done

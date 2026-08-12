@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=apex-oledd
+Comment=Drives the OLED on the SteelSeries Apex Pro Gen 3 keyboard
+Exec=apex-oledd-supervise
+Terminal=false
+X-KDE-autostart-phase=2
+NoDisplay=true

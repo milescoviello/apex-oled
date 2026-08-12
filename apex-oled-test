@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""apex-oled-test - self-contained checks for the OLED tooling.
+
+No pytest dependency and no keyboard required: everything here is pure
+rendering/packing logic. Run it after touching apex-oled or apex-oledd.
+
+    apex-oled-test          # run all, print a summary
+    apex-oled-test -v       # list every check
+"""
+import os
+import random
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+
+from PIL import Image, ImageDraw
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+apex = SourceFileLoader('apex_oled', os.path.join(_HERE, 'apex-oled')).load_module()
+oledd = SourceFileLoader('apex_oledd', os.path.join(_HERE, 'apex-oledd')).load_module()
+
+W, H = apex.WIDTH, apex.HEIGHT
+FAILS, RUN = [], []
+
+
+def check(name):
+    def deco(fn):
+        RUN.append((name, fn))
+        return fn
+    return deco
+
+
+def eq(got, want, what=''):
+    if got != want:
+        raise AssertionError(f'{what}: got {got!r}, want {want!r}')
+
+
+# --- packing ---------------------------------------------------------------
+
+def _patterns():
+    random.seed(7)
+    imgs = []
+    noise = Image.new('1', (W, H), 0)
+    px = noise.load()
+    for y in range(H):
+        for x in range(W):
+            px[x, y] = random.randint(0, 1)
+    imgs.append(('noise', noise))
+
+    corners = Image.new('1', (W, H), 0)
+    p = corners.load()
+    for xy in ((0, 0), (W - 1, 0), (0, H - 1), (W - 1, H - 1)):
+        p[xy] = 1
+    imgs.append(('corners', corners))
+
+    for name, fn in (('rows', lambda x, y: y % 2),
+                     ('cols', lambda x, y: x % 2),
+                     ('diag', lambda x, y: (x + y) % 2),
+                     ('pageedge', lambda x, y: 1 if y % 8 in (0, 7) else 0)):
+        im = Image.new('1', (W, H), 0)
+        q = im.load()
+        for y in range(H):
+            for x in range(W):
+                q[x, y] = fn(x, y)
+        imgs.append((name, im))
+
+    blank = Image.new('1', (W, H), 0)
+    full = Image.new('1', (W, H), 1)
+    imgs += [('blank', blank), ('full', full)]
+
+    text = Image.new('1', (W, H), 0)
+    ImageDraw.Draw(text).text((2, 2), 'Testing 123', fill=1)
+    imgs.append(('text', text))
+    return imgs
+
+
+@check('pack() matches the reference implementation')
+def t_pack_matches_reference():
+    for name, img in _patterns():
+        a, b = apex.pack(img), apex.pack_reference(img)
+        eq(len(a), 640, f'{name} length')
+        if a != b:
+            i = next(i for i, (p, q) in enumerate(zip(a, b)) if p != q)
+            raise AssertionError(f'{name}: first differing byte at {i}')
+
+
+@check('unpack() round-trips pack()')
+def t_unpack_roundtrip():
+    for name, img in _patterns():
+        back = apex.unpack(apex.pack(img))
+        # Compare packed bits, not pixel ints: mode '1' stores an assigned 1
+        # as 1 but a decoded set pixel as 255, so getdata() would differ on
+        # images that are actually identical.
+        if back.tobytes() != img.tobytes():
+            raise AssertionError(f'{name}: round trip changed pixels')
+
+
+@check('pack() rejects wrong-sized framebuffers')
+def t_unpack_validates():
+    for bad in (b'', b'\x00' * 639, b'\x00' * 641):
+        try:
+            apex.unpack(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'accepted {len(bad)}-byte framebuffer')
+
+
+@check('pack() resizes and dithers non-native input')
+def t_pack_resizes():
+    eq(len(apex.pack(Image.new('RGB', (640, 200), (128, 128, 128)))), 640,
+       'resized RGB input')
+
+
+# --- text layout -----------------------------------------------------------
+
+@check('wrap() balances rather than packing greedily')
+def t_wrap_balanced():
+    font = oledd.Fonts(oledd.DEFAULTS).get(12)
+    rows = oledd.wrap('Blow by blow and go away', 124, font, lines=2)
+    if rows is None:
+        raise AssertionError('failed to wrap a line that fits')
+    eq(len(rows), 2, 'row count')
+    wa, wb = (oledd.text_width(r, font) for r in rows)
+    # greedy would leave a stray last word; balanced keeps the halves close
+    if abs(wa - wb) > max(wa, wb) * 0.5:
+        raise AssertionError(f'rows badly unbalanced: {rows}')
+
+
+@check('wrap() returns None when it cannot fit')
+def t_wrap_gives_up():
+    font = oledd.Fonts(oledd.DEFAULTS).get(12)
+    long = 'supercalifragilisticexpialidocious ' * 6
+    eq(oledd.wrap(long, 124, font, lines=2), None, 'unfittable text')
+
+
+@check('wrap() keeps every word, in order')
+def t_wrap_lossless():
+    font = oledd.Fonts(oledd.DEFAULTS).get(12)
+    for s in ('Yeah, you do not know my mind, you do not know my kind',
+              'in its right place', 'Playing the hand'):
+        for lines in (2, 3):
+            rows = oledd.wrap(s, 124, font, lines=lines)
+            if rows and ' '.join(rows).split() != s.split():
+                raise AssertionError(f'words changed: {rows}')
+
+
+@check('fit() truncates to the available width')
+def t_fit():
+    font = oledd.Fonts(oledd.DEFAULTS).get(12)
+    out = oledd.fit('Red Hot Chili Peppers - Dark Necessities', 80, font)
+    if oledd.text_width(out, font) > 80:
+        raise AssertionError(f'{out!r} still too wide')
+    if not out.endswith('..'):
+        raise AssertionError(f'{out!r} not marked as truncated')
+    eq(oledd.fit('short', 124, font), 'short', 'text that already fits')
+
+
+# --- bars ------------------------------------------------------------------
+
+@check('draw_bar() handles 0, tiny, half and full without crashing')
+def t_bar_edges():
+    for frac in (None, 0.0, 0.001, 0.01, 0.5, 0.999, 1.0, -5.0, 5.0):
+        img = Image.new('1', (W, H), 0)
+        oledd.draw_bar(img, (3, 2, 60, 8), frac)   # regression: 1% crashed here
+
+
+@check('draw_bar() fill scales with the fraction')
+def t_bar_monotonic():
+    def lit(frac):
+        img = Image.new('1', (W, H), 0)
+        oledd.draw_bar(img, (3, 2, 60, 8), frac)
+        px = img.load()
+        return sum(1 for x in range(W) for y in range(H) if px[x, y])
+    a, b, c = lit(0.0), lit(0.5), lit(1.0)
+    if not a < b < c:
+        raise AssertionError(f'not monotonic: 0%={a} 50%={b} 100%={c}')
+
+
+# --- sources ---------------------------------------------------------------
+
+class _Ctx:
+    def __init__(self):
+        self.cfg = oledd.load_config('/nonexistent')
+        self.fonts = oledd.Fonts(self.cfg)
+        self.s = None
+
+
+@check('LyricsSource renders every layout branch to a valid frame')
+def t_lyrics_layouts():
+    import json
+    import os
+    import time
+    ctx = _Ctx()
+    now = time.time()
+    cases = [
+        ('short', 'Playing the hand', True),
+        ('two rows', 'Blow by blow and go away', True),
+        ('three rows', "Yeah, you do not know my mind, you do not know my kind", True),
+        ('unsynced', '', False),
+    ]
+    for name, lyric, synced in cases:
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump({'artist': 'Radiohead', 'title': 'Everything In Its Right Place',
+                       'playing': True, 'anchor_wall': now, 'anchor_pos': 42.0,
+                       'duration': 251.0, 'lyrics_synced': synced,
+                       'written_at': now,
+                       'lyrics': [[0.0, lyric]] if synced else []}, f)
+            path = f.name
+        try:
+            src = oledd.LyricsSource(ctx, path)
+            if not src.active(now):
+                raise AssertionError(f'{name}: source inactive')
+            img = src.render(now)
+            eq(img.size, (W, H), f'{name} frame size')
+            eq(img.mode, '1', f'{name} frame mode')
+        finally:
+            os.unlink(path)
+
+
+@check('LyricsSource goes inactive on stale or stopped state')
+def t_lyrics_inactive():
+    import json
+    import os
+    import time
+    ctx = _Ctx()
+    now = time.time()
+    # Note: paused is deliberately NOT here - it stays active for pause_hold
+    # seconds so the now-playing card lingers. See t_pause_hold.
+    for name, patch in (('stale', {'written_at': now - 999}),
+                        ('no title', {'title': ''})):
+        st = {'artist': 'A', 'title': 'T', 'playing': True, 'anchor_wall': now,
+              'anchor_pos': 0.0, 'duration': 100.0, 'lyrics_synced': False,
+              'written_at': now, 'lyrics': []}
+        st.update(patch)
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump(st, f)
+            path = f.name
+        try:
+            if oledd.LyricsSource(ctx, path).active(now):
+                raise AssertionError(f'{name}: should be inactive')
+        finally:
+            os.unlink(path)
+
+
+@check('otsu_threshold() adapts to dark and bright images')
+def t_otsu():
+    # bimodal: half the pixels at 40, half at 200 -> cutoff between them
+    hist = [0] * 256
+    hist[40] = 500
+    hist[200] = 500
+    cut = oledd.otsu_threshold(hist)
+    if not 40 <= cut < 200:
+        raise AssertionError(f'bimodal cutoff {cut} not between the modes')
+    # a dark cover: everything under 60. A fixed 128 renders this black;
+    # otsu must land inside the actual range so detail survives.
+    hist = [0] * 256
+    for v in range(10, 60):
+        hist[v] = 20
+    cut = oledd.otsu_threshold(hist)
+    if not 10 <= cut < 60:
+        raise AssertionError(f'dark-image cutoff {cut} outside the data')
+    # a bright cover: everything over 200
+    hist = [0] * 256
+    for v in range(200, 250):
+        hist[v] = 20
+    cut = oledd.otsu_threshold(hist)
+    if not 200 <= cut < 250:
+        raise AssertionError(f'bright-image cutoff {cut} outside the data')
+    eq(oledd.otsu_threshold([0] * 256), 128, 'empty histogram falls back')
+
+
+@check('tile_score() ranks a blank tile worse than a structured one')
+def t_tile_score():
+    blank = Image.new('1', (34, 34), 0)
+    white = Image.new('1', (34, 34), 1)
+    half = Image.new('1', (34, 34), 0)
+    ImageDraw.Draw(half).rectangle([0, 0, 33, 16], fill=1)      # clean shapes
+    noise = Image.new('1', (34, 34), 0)
+    px = noise.load()
+    random.seed(3)
+    for y in range(34):
+        for x in range(34):
+            px[x, y] = random.randint(0, 1)
+    s_blank, s_white = oledd.tile_score(blank), oledd.tile_score(white)
+    s_half, s_noise = oledd.tile_score(half), oledd.tile_score(noise)
+    if not s_half < s_blank:
+        raise AssertionError(f'blank ({s_blank:.3f}) scored better than shapes ({s_half:.3f})')
+    if not s_half < s_white:
+        raise AssertionError(f'all-white ({s_white:.3f}) scored better than shapes')
+    if not s_half < s_noise:
+        raise AssertionError(f'noise ({s_noise:.3f}) scored better than shapes')
+
+
+@check('in_gap() finds intros, breaks, outros - not normal line spacing')
+def t_in_gap():
+    G = oledd.LyricsSource.in_gap
+    lyrics = [[10.0, 'first line'], [14.0, 'second line'], [40.0, 'after a break']]
+    cases = [
+        (0.0,  True,  'before the first line'),
+        (11.0, False, 'just after a line started'),
+        (14.5, False, 'normal 4s line spacing'),
+        (25.0, True,  'middle of a 26s instrumental break'),
+        (39.0, False, 'next line is imminent'),
+        (41.0, False, 'just after the last line'),
+        (60.0, True,  'outro, well past the last line'),
+    ]
+    for pos, want, why in cases:
+        got = G(lyrics, pos, 8.0)
+        if got != want:
+            raise AssertionError(f'pos={pos} ({why}): got {got}, want {want}')
+    # an explicit blank in the .lrc is always a gap
+    eq(G([[0.0, ''], [30.0, 'x']], 1.0, 8.0), True, 'blank lyric line')
+
+
+@check('LyricsSource holds the card briefly after a pause, then yields')
+def t_pause_hold():
+    import json
+    import os
+    import time
+    ctx = _Ctx()
+    now = time.time()
+    st = {'artist': 'A', 'title': 'T', 'playing': False, 'anchor_wall': now,
+          'anchor_pos': 5.0, 'duration': 100.0, 'lyrics_synced': False,
+          'written_at': now, 'lyrics': []}
+    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+        json.dump(st, f)
+        path = f.name
+    try:
+        src = oledd.LyricsSource(ctx, path)
+        hold = ctx.cfg['lyrics']['pause_hold']
+        eq(src.active(now), True, 'just paused')
+        eq(src.active(now + hold / 2), True, 'inside the hold window')
+        eq(src.active(now + hold + 1), False, 'after the hold window')
+    finally:
+        os.unlink(path)
+
+
+@check('resuming playback clears the pause timer')
+def t_pause_reset():
+    import json
+    import os
+    import time
+    ctx = _Ctx()
+    now = time.time()
+    paused = {'artist': 'A', 'title': 'T', 'playing': False, 'anchor_wall': now,
+              'anchor_pos': 5.0, 'duration': 100.0, 'lyrics_synced': False,
+              'written_at': now, 'lyrics': []}
+    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+        json.dump(paused, f)
+        path = f.name
+    try:
+        src = oledd.LyricsSource(ctx, path)
+        src.active(now)
+        # resume: rewrite the file as playing and force a reload
+        with open(path, 'w') as f:
+            json.dump({**paused, 'playing': True, 'written_at': now + 100}, f)
+        os.utime(path, (now + 100, now + 100))
+        src._checked = 0
+        eq(src.active(now + 100), True, 'playing again')
+        # pause once more; the window must restart, not count from the first pause
+        with open(path, 'w') as f:
+            json.dump({**paused, 'written_at': now + 200}, f)
+        os.utime(path, (now + 200, now + 200))
+        src._checked = 0
+        eq(src.active(now + 200), True, 'newly paused holds again')
+    finally:
+        os.unlink(path)
+
+
+@check('NotifySource expires its frame')
+def t_notify_expiry():
+    import time
+    ctx = _Ctx()
+    n = oledd.NotifySource(ctx)
+    now = time.time()
+    eq(n.active(now), False, 'empty notify source')
+    n.push(Image.new('1', (W, H), 0), 0.5)
+    eq(n.active(now), True, 'just pushed')
+    eq(n.active(now + 5), False, 'after expiry')
+
+
+@check('config defaults load when the file is missing or broken')
+def t_config():
+    cfg = oledd.load_config('/nonexistent/config.toml')
+    eq(cfg['display']['blank_on_lock'], True, 'default blank_on_lock')
+    with tempfile.NamedTemporaryFile('w', suffix='.toml', delete=False) as f:
+        f.write('this is not valid toml {{{')
+        bad = f.name
+    cfg = oledd.load_config(bad)
+    eq(cfg['fonts']['family'], 'condensed', 'defaults survive a broken file')
+    with tempfile.NamedTemporaryFile('w', suffix='.toml', delete=False) as f:
+        f.write('[fonts]\nui_size = 99\n')
+        good = f.name
+    cfg = oledd.load_config(good)
+    eq(cfg['fonts']['ui_size'], 99, 'override applied')
+    eq(cfg['fonts']['family'], 'condensed', 'unspecified keys keep defaults')
+
+
+@check('compose() keeps the burn-in shift inside the panel')
+def t_compose_bounds():
+    cfg = oledd.load_config('/nonexistent')
+    src = Image.new('1', (W, H), 1)
+    for t in range(0, 1200, 7):
+        out = oledd.compose(src, float(t), cfg)
+        eq(out.size, (W, H), 'composed size')
+
+
+def main():
+    verbose = '-v' in sys.argv
+    for name, fn in RUN:
+        try:
+            fn()
+            if verbose:
+                print(f'  ok    {name}')
+        except Exception as e:
+            FAILS.append((name, e))
+            print(f'  FAIL  {name}\n          {e}')
+    print(f'\n{len(RUN) - len(FAILS)}/{len(RUN)} checks passed')
+    return 1 if FAILS else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

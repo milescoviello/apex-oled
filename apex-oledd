@@ -1,0 +1,1269 @@
+#!/usr/bin/env python3
+"""apex-oledd - arbitration daemon for the Apex Pro Gen 3 OLED.
+
+One process owns the panel. Sources declare a priority and whether they
+currently have anything to say; the highest-priority active source wins the
+screen. Without this, every producer would be a separate cron job racing to be
+the last writer.
+
+Sources, highest priority first:
+
+    notify  (100)  transient frames pushed over the IPC socket by `apex-oled`
+    game     (30)  thermals + swap thrash, while gamemode is active
+    lyrics   (20)  now playing + synced lyric line, from the nowplaying daemon
+    idle      (0)  RAM/VRAM bars over CPU and GPU rows - always active
+
+Adding one is a subclass with active()/render(); see Source below.
+
+Burn-in: this is an OLED showing largely static content, so the whole frame is
+nudged around a small pixel-shift orbit, and the panel blanks when the session
+locks. Content is drawn inside a margin so the shift never clips it.
+
+Config lives at ~/.config/apex-oled/config.toml; see DEFAULTS.
+"""
+import argparse
+import glob
+import itertools
+import json
+import math
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from importlib.machinery import SourceFileLoader
+
+from PIL import Image, ImageDraw, ImageFont, features
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+apex = SourceFileLoader('apex_oled', os.path.join(_HERE, 'apex-oled')).load_module()
+WIDTH, HEIGHT = apex.WIDTH, apex.HEIGHT
+
+CONFIG_PATH = os.path.expanduser('~/.config/apex-oled/config.toml')
+SOCKET_PATH = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'),
+                           'apex-oledd.sock')
+NOWPLAYING_STATE = os.path.expanduser('~/.cache/nowplaying/state.json')
+STATE_STALE_AFTER = 20.0      # s; older than this and we assume its daemon died
+
+# DejaVu lives in different places across distros; first hit wins.
+FONT_DIRS = [
+    '/usr/share/fonts/dejavu',
+    '/usr/share/fonts/truetype/dejavu',
+    '/usr/share/fonts/TTF',
+    '/usr/share/fonts/dejavu-sans-fonts',
+]
+FONT_FILES = {
+    'condensed': 'DejaVuSansCondensed.ttf',
+    'condensed-bold': 'DejaVuSansCondensed-Bold.ttf',
+    'sans': 'DejaVuSans.ttf',
+    'mono': 'DejaVuSansMono.ttf',
+}
+
+DEFAULTS = {
+    'display': {
+        'blank_on_lock': True,
+        'blank_on_idle': False,
+        'burnin_shift': 2,
+        'burnin_period': 611.0,
+    },
+    'fonts': {
+        # ui_size 10 gives a 13px line, so three rows fit 40px exactly.
+        # Anything larger clips the bottom row - see row_steps().
+        'family': 'condensed',
+        'ui_size': 10,
+        'lyric_size': 12,
+        'small_size': 9,
+    },
+    'idle': {
+        'bars': ['ram', 'vram'],
+    },
+    'lyrics': {
+        'album_art': True,
+        # otsu | threshold | dither | equalize | auto - how a cover is reduced
+        # to 1 bit. auto renders each candidate and keeps the best-scoring.
+        'art_mode': 'auto',
+        'art_size': 34,
+        # Keep the now-playing card up this long after a pause, then let the
+        # monitoring screen take over.
+        'pause_hold': 15.0,
+        # Show the card instead of a stale lyric when there is this much empty
+        # space on *both* sides of the current line - an instrumental break,
+        # an intro, or an outro. Large enough that a slow song's normal
+        # line-to-line spacing never triggers it.
+        'gap_seconds': 8.0,
+    },
+    'game': {
+        'enabled': True,
+    },
+    'sources': {
+        'notify': 100, 'game': 30, 'lyrics': 20, 'idle': 0,
+    },
+}
+
+
+def load_config(path=CONFIG_PATH):
+    """DEFAULTS with the TOML file merged over it, one level deep."""
+    cfg = {k: dict(v) for k, v in DEFAULTS.items()}
+    try:
+        with open(path, 'rb') as f:
+            user = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return cfg
+    for section, values in user.items():
+        if isinstance(values, dict):
+            cfg.setdefault(section, {}).update(values)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# text
+# ---------------------------------------------------------------------------
+
+class Fonts:
+    """Truetype when Pillow has freetype, else the bundled bitmap font.
+
+    Without freetype every size collapses to the same 6x11 bitmap cell, so
+    layouts must not assume the requested size was honoured - ask line_height().
+    """
+
+    def __init__(self, cfg):
+        self.scalable = features.check('freetype2')
+        name = FONT_FILES.get(cfg['fonts']['family'], FONT_FILES['condensed'])
+        self.path = next(
+            (os.path.join(d, name) for d in FONT_DIRS
+             if os.path.exists(os.path.join(d, name))), None)
+        if self.path is None:
+            self.scalable = False       # fall back to the bundled bitmap font
+        self._cache = {}
+
+    def get(self, size):
+        if size not in self._cache:
+            font = None
+            if self.scalable:
+                try:
+                    font = ImageFont.truetype(self.path, size)
+                except OSError:
+                    font = None
+            self._cache[size] = font or ImageFont.load_default()
+        return self._cache[size]
+
+
+_probe = ImageDraw.Draw(Image.new('1', (1, 1)))
+
+
+def text_width(s, font):
+    return int(_probe.textlength(s, font=font))
+
+
+def line_height(font):
+    try:
+        ascent, descent = font.getmetrics()
+        return ascent + descent
+    except AttributeError:
+        return 11
+
+
+def draw_text(img, xy, s, font, fill=1):
+    ImageDraw.Draw(img).text(xy, s, font=font, fill=fill)
+
+
+def draw_centered(img, y, s, font, x0=0, x1=WIDTH):
+    draw_text(img, (x0 + (x1 - x0 - text_width(s, font)) // 2, y), s, font)
+
+
+def draw_right(img, x_right, y, s, font):
+    """Right-align at x_right, so numbers don't jitter as digit counts change."""
+    draw_text(img, (x_right - text_width(s, font), y), s, font)
+
+
+def wrap(s, avail, font, lines=2):
+    """Balanced word wrap into at most `lines` rows, or None if it won't fit.
+
+    Balanced rather than greedy: greedy packs the first row full and leaves a
+    stray word below ("Blow by blow and go" / "away"), which looks broken on a
+    panel this small. This picks the split with the evenest rows.
+    """
+    if text_width(s, font) <= avail:
+        return [s]
+    words = s.split()
+    if len(words) < lines:
+        return None
+    best = None
+    for cuts in itertools.combinations(range(1, len(words)), lines - 1):
+        parts, prev = [], 0
+        for c in cuts + (len(words),):
+            parts.append(' '.join(words[prev:c]))
+            prev = c
+        widths = [text_width(p, font) for p in parts]
+        if max(widths) > avail:
+            continue
+        score = max(widths) - min(widths)
+        if best is None or score < best[0]:
+            best = (score, parts)
+    return best[1] if best else None
+
+
+def fit(s, avail, font):
+    """Truncate to `avail`, marking the cut with an ellipsis."""
+    if text_width(s, font) <= avail:
+        return s
+    while s and text_width(s + '..', font) > avail:
+        s = s[:-1]
+    return s.rstrip() + '..'
+
+
+def row_steps(font, count=3, height=HEIGHT):
+    """Top y for `count` evenly spaced rows that are guaranteed not to clip.
+
+    Derived from the font rather than hardcoded: bumping the font size used to
+    silently push the last row off the bottom of the panel.
+    """
+    lh = line_height(font)
+    step = min(lh + 1, max(1, (height - lh) // max(1, count - 1)))
+    return [i * step for i in range(count)]
+
+
+def layout_text(s, avail_w, avail_h, fonts, sizes, max_lines=3):
+    """Largest font and fewest rows that fit `s` into the given box.
+
+    Returns (rows, font, line_height) or None. Trying sizes largest-first
+    means short lyrics get big type and only long ones shrink.
+    """
+    for size in sizes:
+        font = fonts.get(size)
+        lh = line_height(font)
+        for n in range(1, min(max_lines, avail_h // lh) + 1):
+            rows = wrap(s, avail_w, font, lines=n)
+            if rows:
+                return rows, font, lh
+    return None
+
+
+def otsu_threshold(hist):
+    """Otsu's method: the grey cutoff that best separates dark from light.
+
+    Chosen per image from its own histogram, which is what rescues covers
+    that are uniformly dark or bright - a fixed cutoff renders those blank.
+    """
+    total = sum(hist)
+    if not total:
+        return 128
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    sum_b = w_b = 0
+    best_var, best_cut = -1.0, 128
+    for t, count in enumerate(hist):
+        w_b += count
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += t * count
+        mean_b = sum_b / w_b
+        mean_f = (sum_all - sum_b) / w_f
+        var = w_b * w_f * (mean_b - mean_f) ** 2
+        if var > best_var:
+            best_var, best_cut = var, t
+    return best_cut
+
+
+def tile_score(im):
+    """Lower is better. Penalises speckle and near-blank tiles.
+
+    Speckle is the fraction of neighbouring pixels that differ: high means
+    the eye sees noise rather than shapes. The ink term punishes tiles that
+    came out almost all black or all white, which score deceptively well on
+    speckle alone precisely because they carry no image.
+    """
+    px = im.load()
+    w, h = im.size
+    diff = tot = lit = 0
+    for y in range(h):
+        for x in range(w):
+            lit += 1 if px[x, y] else 0
+            if x + 1 < w:
+                tot += 1
+                diff += px[x, y] != px[x + 1, y]
+            if y + 1 < h:
+                tot += 1
+                diff += px[x, y] != px[x, y + 1]
+    speckle = diff / tot if tot else 1.0
+    ink = lit / (w * h)
+    return speckle + 1.5 * max(0.0, abs(ink - 0.5) - 0.25)
+
+
+def draw_bar(img, box, frac):
+    """Outlined capacity bar with a filled portion. box = (x0, y0, x1, y1).
+
+    frac of None draws the empty outline, which is how an asleep dGPU reads.
+    """
+    x0, y0, x1, y1 = box
+    d = ImageDraw.Draw(img)
+    d.rectangle([x0, y0, x1, y1], outline=1, fill=0)
+    if frac is None:
+        return
+    inner = x1 - x0 - 2
+    frac = min(1.0, max(0.0, frac))
+    # A very small fraction rounds to zero width; draw nothing rather than an
+    # inverted rectangle (VRAM at 1% of 24G hit exactly this).
+    w = int(round(inner * frac)) if inner > 0 else 0
+    if w > 0:
+        d.rectangle([x0 + 1, y0 + 1, x0 + w, y1 - 1], fill=1)
+
+
+# ---------------------------------------------------------------------------
+# sensors
+# ---------------------------------------------------------------------------
+
+class Sensors:
+    """Cheap sysfs reads, plus a background poll for anything expensive.
+
+    nvidia-smi costs ~200 ms and, worse, touching the dGPU keeps it awake. So
+    it is only run when the card is already active, on its own thread, and the
+    result is cached. loginctl and gamemoded ride along on the same thread.
+    """
+    SLOW_INTERVAL = 5.0
+
+    def __init__(self):
+        self._cpu_temp_path = None
+        self._rapl = None
+        self._last_energy = None
+        self._last_cpu = None
+        self._last_swap = None
+        self._gpu = {}
+        self._session = {}
+        self._gamemode = False
+        self._resolve()
+        # Prime the counters so the first frame has a baseline to differentiate
+        # against instead of showing blanks.
+        if self._rapl:
+            uj = self._read(self._rapl, int)
+            if uj is not None:
+                self._last_energy = (time.time(), uj)
+        self.cpu_util()
+        self.swap_rate()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._slow_loop, daemon=True)
+        self._thread.start()
+
+    def _resolve(self):
+        for h in glob.glob('/sys/class/hwmon/hwmon*'):
+            try:
+                if open(h + '/name').read().strip() != 'coretemp':
+                    continue
+                for lbl in sorted(glob.glob(h + '/temp*_label')):
+                    if open(lbl).read().strip() == 'Package id 0':
+                        self._cpu_temp_path = lbl.replace('_label', '_input')
+                        break
+            except OSError:
+                continue
+        p = '/sys/class/powercap/intel-rapl:0/energy_uj'
+        self._rapl = p if os.access(p, os.R_OK) else None
+
+    @staticmethod
+    def _read(path, cast=str, default=None):
+        try:
+            with open(path) as f:
+                return cast(f.read().strip())
+        except (OSError, ValueError):
+            return default
+
+    # --- fast paths (sysfs / procfs, called every frame) -------------------
+
+    def cpu_temp(self):
+        if not self._cpu_temp_path:
+            self._resolve()
+        v = self._read(self._cpu_temp_path, int) if self._cpu_temp_path else None
+        return None if v is None else v // 1000
+
+    def cpu_util(self):
+        """Busy percentage across all cores, from /proc/stat deltas.
+
+        iowait counts as idle, matching what top and btop report.
+        """
+        try:
+            with open('/proc/stat') as f:
+                parts = f.readline().split()
+            vals = [int(x) for x in parts[1:11]]
+        except (OSError, ValueError, IndexError):
+            return None
+        total, idle = sum(vals), vals[3] + vals[4]
+        prev, self._last_cpu = self._last_cpu, (total, idle)
+        if not prev:
+            return None
+        dt, di = total - prev[0], idle - prev[1]
+        if dt <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * (dt - di) / dt))
+
+    def cpu_watts(self):
+        """Package power from the RAPL energy counter, differentiated."""
+        if not self._rapl:
+            return None
+        now, uj = time.time(), self._read(self._rapl, int)
+        if uj is None:
+            return None
+        prev, self._last_energy = self._last_energy, (now, uj)
+        if not prev:
+            return None
+        dt, duj = now - prev[0], uj - prev[1]
+        if dt <= 0 or duj < 0:      # counter wrapped
+            return None
+        return duj / dt / 1e6
+
+    def mem(self):
+        """(used, total) in GiB, where used = MemTotal - MemAvailable.
+
+        MemAvailable (not MemFree) is the honest figure: it already accounts
+        for reclaimable cache, so this tracks what is actually committed.
+        """
+        total = avail = None
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    key, _, rest = line.partition(':')
+                    if key == 'MemTotal':
+                        total = int(rest.split()[0])
+                    elif key == 'MemAvailable':
+                        avail = int(rest.split()[0])
+                        break
+        except (OSError, ValueError, IndexError):
+            return None
+        if total is None or avail is None:
+            return None
+        return (total - avail) / 1048576.0, total / 1048576.0   # kB -> GiB
+
+    def swap(self):
+        """(used, total) in GiB."""
+        total = free = None
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    key, _, rest = line.partition(':')
+                    if key == 'SwapTotal':
+                        total = int(rest.split()[0])
+                    elif key == 'SwapFree':
+                        free = int(rest.split()[0])
+                        break
+        except (OSError, ValueError, IndexError):
+            return None
+        if not total:
+            return None
+        return (total - free) / 1048576.0, total / 1048576.0
+
+    def swap_rate(self):
+        """(in, out) in MiB/s from /proc/vmstat page counters.
+
+        This is the gaming-stutter signature: framerate collapses while the GPU
+        sits idle because the machine is paging, and nothing on screen says so.
+        """
+        pin = pout = None
+        try:
+            with open('/proc/vmstat') as f:
+                for line in f:
+                    if line.startswith('pswpin '):
+                        pin = int(line.split()[1])
+                    elif line.startswith('pswpout '):
+                        pout = int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        if pin is None or pout is None:
+            return None
+        now = time.time()
+        prev, self._last_swap = self._last_swap, (now, pin, pout)
+        if not prev:
+            return None
+        dt = now - prev[0]
+        if dt <= 0:
+            return None
+        # pages -> MiB, assuming the usual 4 KiB page
+        return (max(0, pin - prev[1]) * 4 / 1024 / dt,
+                max(0, pout - prev[2]) * 4 / 1024 / dt)
+
+    # --- slow paths (subprocess, polled on a thread) -----------------------
+
+    def gpu_awake(self):
+        for d in glob.glob('/sys/bus/pci/devices/*'):
+            if (self._read(d + '/vendor') == '0x10de'
+                    and self._read(d + '/class') == '0x030000'):
+                return self._read(d + '/power/runtime_status') == 'active'
+        return False
+
+    def _poll_gpu(self):
+        if not self.gpu_awake():
+            self._gpu = {}
+            return
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=temperature.gpu,power.draw,'
+                 'utilization.gpu,memory.used,memory.total',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+            t, w, u, mu, mt = (x.strip() for x in out.split(',')[:5])
+            self._gpu = {'temp': int(float(t)), 'watts': float(w),
+                         'util': int(float(u)),
+                         'vram_used': float(mu) / 1024.0,     # MiB -> GiB
+                         'vram_total': float(mt) / 1024.0}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self._gpu = {}
+
+    def _poll_session(self):
+        """LockedHint/IdleHint for the graphical session, via logind."""
+        try:
+            sid = subprocess.run(['loginctl', 'show-user', str(os.getuid()),
+                                  '-p', 'Display', '--value'],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout.strip()
+            if not sid:
+                # No "display" session recorded; fall back to the first session
+                # that has a seat, which is the graphical one.
+                out = subprocess.run(['loginctl', 'list-sessions', '--no-legend'],
+                                     capture_output=True, text=True,
+                                     timeout=5).stdout
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3].startswith('seat'):
+                        sid = parts[0]
+                        break
+            if not sid:
+                self._session = {}
+                return
+            out = subprocess.run(['loginctl', 'show-session', sid,
+                                  '-p', 'LockedHint', '-p', 'IdleHint'],
+                                 capture_output=True, text=True, timeout=5).stdout
+            d = dict(l.split('=', 1) for l in out.strip().splitlines() if '=' in l)
+            self._session = {'locked': d.get('LockedHint') == 'yes',
+                             'idle': d.get('IdleHint') == 'yes'}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self._session = {}
+
+    def _poll_gamemode(self):
+        try:
+            out = subprocess.run(['gamemoded', '-s'], capture_output=True,
+                                 text=True, timeout=5).stdout
+            self._gamemode = 'is active' in out
+        except (OSError, subprocess.SubprocessError):
+            self._gamemode = False
+
+    def _slow_loop(self):
+        first = True
+        while first or not self._stop.wait(self.SLOW_INTERVAL):
+            first = False
+            if self._stop.is_set():
+                break
+            self._poll_gpu()
+            self._poll_session()
+            self._poll_gamemode()
+
+    def gpu(self):
+        return self._gpu
+
+    def session(self):
+        return self._session
+
+    def gamemode(self):
+        return self._gamemode
+
+    def battery(self):
+        return self._read('/sys/class/power_supply/BAT0/capacity', int)
+
+    def headset(self):
+        """Arctis battery, present only while the headset is powered on."""
+        for p in glob.glob('/sys/class/power_supply/steelseries_headset_*'):
+            v = self._read(p + '/capacity', int)
+            if v is not None:
+                return v
+        return None
+
+    def close(self):
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
+# sources
+# ---------------------------------------------------------------------------
+
+class Source:
+    name = 'base'
+    fps = 1.0
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.priority = ctx.cfg['sources'].get(self.name, 0)
+
+    def active(self, now):
+        return True
+
+    def render(self, now):
+        """Return a 128x40 mode-'1' image, or None to decline the screen."""
+        raise NotImplementedError
+
+
+class NotifySource(Source):
+    """Transient frames pushed in over the IPC socket by the `apex-oled` CLI.
+
+    Without this the CLI is useless while the daemon runs: it writes a frame
+    and the daemon overwrites it within one tick.
+    """
+    name = 'notify'
+    fps = 10.0
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._lock = threading.Lock()
+        self._frame = None
+        self._expires = 0.0
+
+    def push(self, img, secs):
+        with self._lock:
+            self._frame = img
+            self._expires = time.time() + max(0.1, secs)
+
+    def clear(self):
+        with self._lock:
+            self._frame = None
+            self._expires = 0.0
+
+    def active(self, now):
+        with self._lock:
+            if self._frame is not None and now >= self._expires:
+                self._frame = None
+            return self._frame is not None
+
+    def render(self, now):
+        with self._lock:
+            return self._frame
+
+
+class GameSource(Source):
+    """Thermals and swap thrash while gamemode is active.
+
+    Fullscreen games hide every other readout, so this puts the numbers that
+    explain a stutter - GPU load, and whether the machine is paging - on a
+    surface that is still visible.
+    """
+    name = 'game'
+    fps = 2.0
+
+    def active(self, now):
+        return self.ctx.cfg['game'].get('enabled', True) and self.ctx.s.gamemode()
+
+    def render(self, now):
+        s, f = self.ctx.s, self.ctx.fonts
+        ui = f.get(self.ctx.cfg['fonts']['ui_size'])
+        img = Image.new('1', (WIDTH, HEIGHT), 0)
+        gpu = s.gpu()
+        r0, r1, r2 = row_steps(ui, 3)
+
+        draw_text(img, (3, r0), 'GPU', ui)
+        draw_right(img, 78, r0, f"{gpu['util']}%" if gpu else '--', ui)
+        draw_right(img, 125, r0, f"{gpu['temp']}c" if gpu else '--', ui)
+
+        draw_text(img, (3, r1), 'CPU', ui)
+        u = s.cpu_util()
+        draw_right(img, 78, r1, f'{u:.0f}%' if u is not None else '--', ui)
+        t = s.cpu_temp()
+        draw_right(img, 125, r1, f'{t}c' if t is not None else '--', ui)
+
+        # The payoff line: sustained swap traffic is the stutter you cannot
+        # otherwise see, so it takes the row whenever it is happening.
+        rate = s.swap_rate()
+        if rate and (rate[0] > 0.05 or rate[1] > 0.05):
+            draw_text(img, (3, r2), 'SWAP', ui)
+            draw_right(img, 125, r2,
+                       f'{rate[0]:.0f}/{rate[1]:.0f} MB/s', ui)
+        else:
+            mem = s.mem()
+            if mem:
+                draw_text(img, (3, r2), 'RAM', ui)
+                draw_bar(img, (34, r2 + 2, 125, r2 + 8), mem[0] / mem[1])
+        return img
+
+
+class LyricsSource(Source):
+    """Now playing + the current synced lyric, from the nowplaying daemon.
+
+    Consumes its state.json rather than re-implementing MPRIS/LRCLIB. That
+    file carries an *anchor* (wall clock + track position), so position is
+    interpolated locally here and stays smooth without any IPC chatter.
+    """
+    name = 'lyrics'
+    fps = 15.0
+
+    def __init__(self, ctx, path=NOWPLAYING_STATE):
+        super().__init__(ctx)
+        self.path = path
+        self._state = {}
+        self._mtime = 0.0
+        self._checked = 0.0
+        self._art = {}          # cover_file -> dithered thumbnail
+        self._paused_since = None
+
+    def _load(self, now):
+        if now - self._checked < 0.25:
+            return self._state
+        self._checked = now
+        try:
+            m = os.path.getmtime(self.path)
+            if m != self._mtime:
+                with open(self.path) as f:
+                    self._state = json.load(f)
+                self._mtime = m
+        except (OSError, ValueError):
+            self._state = {}
+        return self._state
+
+    def active(self, now):
+        st = self._load(now)
+        if not st or not st.get('title'):
+            self._paused_since = None
+            return False
+        written = st.get('written_at', 0)
+        if written and now - written > STATE_STALE_AFTER:
+            self._paused_since = None
+            return False            # its daemon stopped updating
+        if st.get('playing'):
+            self._paused_since = None
+            return True
+        # Paused: hold the now-playing card briefly, then hand the screen to
+        # the monitoring view. The pause instant is tracked here rather than
+        # read from the state file, because nowplaying keeps rewriting that
+        # file while paused and its timestamp would never go stale.
+        if self._paused_since is None:
+            self._paused_since = now
+        return (now - self._paused_since) < self.ctx.cfg['lyrics'].get(
+            'pause_hold', 5.0)
+
+    def _position(self, st, now):
+        pos = st.get('anchor_pos', 0.0)
+        if st.get('playing'):
+            pos += now - st.get('anchor_wall', now)
+        return max(0.0, pos)
+
+    @staticmethod
+    def _line_at(lyrics, pos):
+        """(text, start of that line, start of the next) at `pos`.
+
+        start is None before the first line; next is None after the last.
+        """
+        text, cur_ts, next_ts = '', None, None
+        for ts, s in lyrics:
+            if ts <= pos:
+                text, cur_ts = s, ts
+            else:
+                next_ts = ts
+                break
+        return text, cur_ts, next_ts
+
+    @classmethod
+    def _current_line(cls, lyrics, pos):
+        return cls._line_at(lyrics, pos)[0]
+
+    @classmethod
+    def in_gap(cls, lyrics, pos, threshold):
+        """True when there is nothing worth reading right now.
+
+        Either the .lrc has an explicit blank at this point, or we are far
+        enough from the lines on both sides that the display would just be
+        holding a stale line - an intro, an instrumental break, or the outro.
+        """
+        text, cur_ts, next_ts = cls._line_at(lyrics, pos)
+        if not text:
+            return True
+        since = pos - cur_ts if cur_ts is not None else float('inf')
+        until = next_ts - pos if next_ts is not None else float('inf')
+        return since > threshold and until > threshold
+
+    def _thumb(self, path, box, mode='auto'):
+        """1-bit cover art fitted to box=(w, h), cached per file+box+mode.
+
+        Modes: otsu | threshold | dither | equalize | auto.
+
+        A fixed 128 cutoff throws away any cover that is uniformly dark or
+        uniformly bright - 44 of 104 covers here reduced to a near-blank tile.
+        `otsu` picks the cutoff from each image's own histogram instead, and
+        `auto` renders every candidate and keeps whichever scores best, so
+        busy photos can land on dither while graphic covers land on a
+        threshold, with no single global choice to regret.
+        """
+        key = (path, box, mode)
+        if key in self._art:
+            return self._art[key]
+        img = None
+        try:
+            from PIL import ImageFilter, ImageOps
+            w, h = box
+            src = Image.open(path).convert('L')
+            # Centre-crop to the target aspect, then downscale.
+            want = w / h
+            have = src.width / src.height
+            if have > want:
+                nw = int(src.height * want)
+                src = src.crop(((src.width - nw) // 2, 0,
+                                (src.width + nw) // 2, src.height))
+            else:
+                nh = int(src.width / want)
+                src = src.crop((0, (src.height - nh) // 2,
+                                src.width, (src.height + nh) // 2))
+            g = src.resize((w, h), Image.LANCZOS)
+            # Downscaling this hard destroys the very edges that survive a
+            # 1-bit conversion; sharpen at the target size to put them back.
+            g = g.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=0))
+            g = ImageOps.autocontrast(g)
+
+            def render(m):
+                if m == 'otsu':
+                    cut = otsu_threshold(g.histogram())
+                    return g.point(lambda v: 255 if v > cut else 0, mode='1')
+                if m == 'threshold':
+                    return g.point(lambda v: 255 if v > 128 else 0, mode='1')
+                if m == 'equalize':
+                    return ImageOps.equalize(g).convert('1')
+                return g.convert('1')          # dither
+
+            if mode == 'auto':
+                cands = [(tile_score(render(m)), m) for m in
+                         ('otsu', 'threshold', 'dither')]
+                cands.sort()
+                img = render(cands[0][1])
+            else:
+                img = render(mode)
+        except (OSError, ValueError):
+            img = None
+        self._art = {key: img}      # only ever need the current track's art
+        return img
+
+    def render(self, now):
+        st = self._load(now)
+        if not st:
+            return None
+        cfg, f = self.ctx.cfg, self.ctx.fonts
+        small = f.get(cfg['fonts']['small_size'])
+        lyric_font = f.get(cfg['fonts']['lyric_size'])
+        img = Image.new('1', (WIDTH, HEIGHT), 0)
+        avail = WIDTH - 4
+
+        pos = self._position(st, now)
+        lyrics = st.get('lyrics') or []
+        synced = bool(st.get('lyrics_synced') and lyrics)
+        line = self._current_line(lyrics, pos) if synced else ''
+
+        artist, title = st.get('artist', ''), st.get('title', '')
+
+        # The now-playing card is the fallback whenever there is no lyric worth
+        # showing: no synced lyrics at all, a gap between lines, or paused.
+        card = (not synced
+                or not st.get('playing')
+                or self.in_gap(lyrics, pos, cfg['lyrics'].get('gap_seconds', 8.0)))
+
+        if card:
+            # Spend the space on the cover instead. When a lyric *is* live it
+            # gets the full width - readability of the words beats decoration.
+            art = None
+            if cfg['lyrics'].get('album_art', True) and st.get('cover_file'):
+                side = int(cfg['lyrics'].get('art_size', 34))
+                art = self._thumb(st['cover_file'], (side, side),
+                                  cfg['lyrics'].get('art_mode', 'auto'))
+            x0 = 3
+            if art is not None:
+                img.paste(art, (3, 3))
+                x0 = 41
+            tw = WIDTH - x0 - 3
+            base = cfg['fonts']['lyric_size']
+            sizes = [base, base - 1, base - 2, base - 3]
+            small_h = line_height(small) if artist else 0
+            placed = layout_text(title, tw, 36 - small_h, f, sizes, max_lines=2)
+            y = 2
+            if placed:
+                rows, font, lh = placed
+                y += max(0, (36 - small_h - lh * len(rows)) // 2)
+                for row in rows:
+                    draw_text(img, (x0, y), row, font)
+                    y += lh
+            else:
+                draw_text(img, (x0, y), fit(title, tw, lyric_font), lyric_font)
+                y += line_height(lyric_font)
+            if artist:
+                draw_text(img, (x0, min(y, 36 - small_h)),
+                          fit(artist, tw, small), small)
+        else:
+            # Wrapped text beats scaled-up text: the line sits still and can be
+            # read at a glance. Pick the largest font and fewest rows that fit;
+            # a lyric too big for the space below the header takes the header's
+            # row too, because the lyric is the point and the title is not.
+            # Scrolling is the last resort - motion is worse than smaller type.
+            base = cfg['fonts']['lyric_size']
+            sizes = [base, base - 1, base - 2, base - 3]
+            # 36 rows of pixels (0..35) sit above the progress bar at y=36.
+            # This must not be 35: three 12px rows need exactly 36, and being
+            # one pixel short silently downgraded long lyrics to a truncation.
+            body_bottom = 36
+            header_h = line_height(small)
+
+            placed = layout_text(line, avail, body_bottom - header_h,
+                                 f, sizes) if line else None
+            show_header = placed is not None
+            if line and placed is None:
+                placed = layout_text(line, avail, body_bottom, f, sizes)
+
+            if show_header:
+                # Static, not a marquee: motion up here fights the lyric for
+                # attention, and you end up staring at a fragment like
+                # "- Dark Necessities". Title alone if the pair won't fit.
+                combined = (f'{artist} - {title}' if artist and title
+                            else (title or artist))
+                header = (combined if text_width(combined, small) <= avail
+                          else fit(title or artist, avail, small))
+                draw_centered(img, 0, header, small)
+
+            if placed:
+                rows, font, lh = placed
+                block = lh * len(rows)
+                top = header_h if show_header else 0
+                room = (body_bottom - top) - block
+                top += max(0, room // 2)
+                for i, row in enumerate(rows):
+                    draw_centered(img, top + i * lh, row, font)
+            elif line:
+                draw_centered(img, 14, fit(line, avail, lyric_font), lyric_font)
+
+        dur = st.get('duration') or 0
+        if dur > 0:
+            frac = max(0.0, min(1.0, pos / dur))
+            d = ImageDraw.Draw(img)
+            d.line([(2, 38), (WIDTH - 3, 38)], fill=1)          # track
+            if frac > 0:                                         # elapsed
+                d.rectangle([2, 36, 2 + int((WIDTH - 5) * frac), 38], fill=1)
+        return img
+
+
+class IdleSource(Source):
+    """Capacity bars over CPU and GPU rows. The default when nothing claims it."""
+    name = 'idle'
+    fps = 1.0
+
+    # Column right-edges. Values are right-aligned to these so a jump from
+    # 99W to 118W doesn't shove the row sideways. Margins are 3/125 rather
+    # than 2/126 to survive the +/-2 px burn-in shift without clipping.
+    COL_TEMP, COL_UTIL, COL_WATT = 57, 91, 125
+
+    BAR_LABELS = {'ram': 'RAM', 'vram': 'VRM', 'swap': 'SWP', 'disk': 'DSK'}
+
+    def _bar_frac(self, kind):
+        s = self.ctx.s
+        if kind == 'ram':
+            m = s.mem()
+            return (m[0] / m[1]) if m else None
+        if kind == 'vram':
+            g = s.gpu()
+            t = g.get('vram_total')
+            return (g['vram_used'] / t) if t else None
+        if kind == 'swap':
+            sw = s.swap()
+            return (sw[0] / sw[1]) if sw and sw[1] else None
+        if kind == 'disk':
+            try:
+                st = os.statvfs(os.path.expanduser('~'))
+                return 1.0 - (st.f_bavail / st.f_blocks) if st.f_blocks else None
+            except OSError:
+                return None
+        return None
+
+    def render(self, now):
+        s, f = self.ctx.s, self.ctx.fonts
+        ui = f.get(self.ctx.cfg['fonts']['ui_size'])
+        img = Image.new('1', (WIDTH, HEIGHT), 0)
+        gpu = s.gpu()
+        rows = row_steps(ui, 3)
+
+        # Top row: capacity bars. Bars beat numbers for "how full is it".
+        kinds = self.ctx.cfg['idle'].get('bars', ['ram', 'vram'])[:2]
+        half = WIDTH // 2
+        for i, kind in enumerate(kinds):
+            label = self.BAR_LABELS.get(kind, kind[:3].upper())
+            x = 3 + i * half
+            draw_text(img, (x, rows[0]), label, ui)
+            lw = text_width(label, ui)
+            draw_bar(img, (x + lw + 3, 2, x + half - 6, 8), self._bar_frac(kind))
+
+        def row(y, label, temp, util, watts):
+            draw_text(img, (3, y), label, ui)
+            draw_right(img, self.COL_TEMP, y,
+                       f'{temp:.0f}c' if temp is not None else '--', ui)
+            draw_right(img, self.COL_UTIL, y,
+                       f'{util:.0f}%' if util is not None else '--', ui)
+            draw_right(img, self.COL_WATT, y,
+                       f'{watts:.0f}W' if watts is not None else '--', ui)
+
+        row(rows[1], 'CPU', s.cpu_temp(), s.cpu_util(), s.cpu_watts())
+        # An asleep dGPU reports nothing rather than being woken up for a readout.
+        row(rows[2], 'GPU', gpu.get('temp'), gpu.get('util'), gpu.get('watts'))
+        return img
+
+
+# ---------------------------------------------------------------------------
+# IPC
+# ---------------------------------------------------------------------------
+
+class Server(threading.Thread):
+    """Unix socket accepting JSON commands, one per connection.
+
+    Doubles as the single-instance lock: if binding fails because something is
+    already listening, another daemon owns the panel.
+    """
+
+    def __init__(self, ctx, path=SOCKET_PATH):
+        super().__init__(daemon=True)
+        self.ctx = ctx
+        self.path = path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.bind(path)
+        except OSError:
+            # Either a live daemon or a socket left behind by a crash.
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(path)
+                raise RuntimeError('already running')
+            except (ConnectionRefusedError, FileNotFoundError):
+                os.unlink(path)
+                self.sock.bind(path)
+            finally:
+                probe.close()
+        self.sock.listen(4)
+        self.sock.settimeout(0.5)
+
+    def run(self):
+        while not self.ctx.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                try:
+                    conn.settimeout(2.0)
+                    data = b''
+                    while b'\n' not in data and len(data) < 1 << 20:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                    reply = self.handle(json.loads(data.decode() or '{}'))
+                except (OSError, ValueError) as e:
+                    reply = {'ok': False, 'error': str(e)}
+                try:
+                    conn.sendall((json.dumps(reply) + '\n').encode())
+                except OSError:
+                    pass
+        try:
+            self.sock.close()
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def handle(self, msg):
+        cmd = msg.get('cmd')
+        notify = self.ctx.notify
+        if cmd == 'notify':
+            secs = float(msg.get('secs', 5.0))
+            if msg.get('fb'):
+                # Client-rendered frame: a packed 640-byte framebuffer, so any
+                # client can push arbitrary pixels without us re-rendering.
+                import base64
+                img = apex.unpack(base64.b64decode(msg['fb']))
+            elif msg.get('image'):
+                img = Image.open(msg['image'])
+            else:
+                img = self.ctx.render_lines(msg.get('lines') or [],
+                                            align=msg.get('align', 'left'),
+                                            size=msg.get('size'))
+            if msg.get('invert'):
+                img = img.convert('L').point(lambda p: 255 - p).convert('1')
+            notify.push(img, secs)
+            return {'ok': True}
+        if cmd == 'clear':
+            notify.clear()
+            return {'ok': True}
+        if cmd == 'status':
+            now = time.time()
+            return {'ok': True, 'source': self.ctx.current_source,
+                    'sources': [s.name for s in self.ctx.sources if s.active(now)],
+                    'blanked': self.ctx.blanked}
+        return {'ok': False, 'error': f'unknown command: {cmd!r}'}
+
+
+# ---------------------------------------------------------------------------
+# daemon
+# ---------------------------------------------------------------------------
+
+class Context:
+    """Shared daemon state handed to every source."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.s = Sensors()
+        self.fonts = Fonts(cfg)
+        self.stop = threading.Event()
+        self.current_source = None
+        self.blanked = False
+        self.notify = None
+        self.sources = []
+
+    def render_lines(self, lines, align='left', size=None):
+        """Text frame used for CLI notifications."""
+        font = self.fonts.get(size or self.cfg['fonts']['ui_size'])
+        img = Image.new('1', (WIDTH, HEIGHT), 0)
+        lines = [str(x) for x in lines][:4]
+        if not lines:
+            return img
+        lh = line_height(font) + 1
+        y = max(0, (HEIGHT - lh * len(lines)) // 2)
+        for line in lines:
+            if align == 'center':
+                draw_centered(img, y, line, font)
+            elif align == 'right':
+                draw_right(img, WIDTH - 3, y, line, font)
+            else:
+                draw_text(img, (3, y), line, font)
+            y += lh
+        return img
+
+    def should_blank(self):
+        d, sess = self.cfg['display'], self.s.session()
+        if d.get('blank_on_lock', True) and sess.get('locked'):
+            return True
+        if d.get('blank_on_idle', False) and sess.get('idle'):
+            return True
+        return False
+
+
+def compose(frame, now, cfg):
+    """Apply the burn-in pixel shift."""
+    radius = cfg['display'].get('burnin_shift', 2)
+    period = cfg['display'].get('burnin_period', 611.0)
+    if radius <= 0:
+        return frame
+    ang = 2 * math.pi * (now % period) / period
+    dx = int(round(radius * math.cos(ang)))
+    dy = int(round((radius / 2) * math.sin(2 * ang)))
+    out = Image.new('1', (WIDTH, HEIGHT), 0)
+    out.paste(frame, (dx, dy))
+    return out
+
+
+def build_sources(ctx):
+    ctx.notify = NotifySource(ctx)
+    sources = [ctx.notify, GameSource(ctx), LyricsSource(ctx), IdleSource(ctx)]
+    return sorted(sources, key=lambda s: -s.priority)
+
+
+def run(args):
+    cfg = load_config(args.config)
+    ctx = Context(cfg)
+    ctx.sources = build_sources(ctx)
+    if args.only:
+        wanted = set(args.only.split(','))
+        ctx.sources = [s for s in ctx.sources if s.name in wanted]
+        if not ctx.sources:
+            sys.exit(f'apex-oledd: no such source: {args.only}')
+
+    if args.preview:
+        time.sleep(1.2)     # let the sensor baselines settle so the frame is real
+        now = time.time()
+        src = next((s for s in ctx.sources if s.active(now)), ctx.sources[-1])
+        frame = compose(src.render(now) or Image.new('1', (WIDTH, HEIGHT), 0),
+                        now, cfg)
+        frame.convert('L').resize((WIDTH * 4, HEIGHT * 4),
+                                  Image.NEAREST).save(args.preview)
+        print(f'{src.name} -> {args.preview}')
+        ctx.s.close()
+        return
+
+    try:
+        server = Server(ctx)
+    except RuntimeError:
+        # Exit 3 is the "another instance owns the panel" contract that
+        # apex-oledd-supervise uses to stop rather than restart-loop.
+        print('apex-oledd: already running', file=sys.stderr)
+        sys.exit(3)
+    server.start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: ctx.stop.set())
+
+    dpy, last_fb = None, None
+    while not ctx.stop.is_set():
+        now = time.time()
+        try:
+            if dpy is None:
+                dpy = apex.Display(args.device)
+                last_fb = None
+                if args.verbose:
+                    print(f'opened {dpy.path}', flush=True)
+
+            if ctx.should_blank():
+                if not ctx.blanked:
+                    dpy.blank()
+                    last_fb, ctx.blanked = None, True
+                    if args.verbose:
+                        print('blanked (session locked/idle)', flush=True)
+                ctx.stop.wait(1.0)
+                continue
+            ctx.blanked = False
+
+            src = next((s for s in ctx.sources if s.active(now)), None)
+            if src is None:
+                ctx.stop.wait(0.5)
+                continue
+            if args.verbose and src.name != ctx.current_source:
+                print(f'source -> {src.name}', flush=True)
+            ctx.current_source = src.name
+
+            frame = src.render(now)
+            if frame is not None:
+                fb = apex.pack(compose(frame, now, cfg))
+                if fb != last_fb:          # skip identical redraws
+                    dpy.send(fb)
+                    last_fb = fb
+            ctx.stop.wait(1.0 / src.fps)
+        except (OSError, RuntimeError) as e:
+            if args.verbose:
+                print(f'device lost ({e}); retrying', flush=True)
+            if dpy is not None:
+                try:
+                    dpy.close()
+                except OSError:
+                    pass
+            dpy = None
+            ctx.stop.wait(2.0)
+
+    ctx.s.close()
+    if dpy is not None:
+        try:
+            dpy.blank()
+            dpy.close()
+        except OSError:
+            pass
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog='apex-oledd',
+        description='Arbitration daemon for the Apex Pro Gen 3 OLED.')
+    p.add_argument('--device', help='hidraw node (default: autodetect)')
+    p.add_argument('--config', default=CONFIG_PATH, help='config TOML')
+    p.add_argument('--only', metavar='NAMES',
+                   help='restrict to these sources, comma-separated')
+    p.add_argument('--preview', metavar='PNG',
+                   help='render one frame to a PNG (4x) and exit; for testing')
+    p.add_argument('-v', '--verbose', action='store_true')
+    run(p.parse_args())
+
+
+if __name__ == '__main__':
+    main()
