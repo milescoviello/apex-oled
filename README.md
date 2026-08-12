@@ -127,7 +127,9 @@ class MySource(Source):
 Then give it a priority in `[sources]`.
 
 The `lyrics` source reads a small JSON state file (default
-`~/.cache/nowplaying/state.json`) written by a separate now-playing daemon.
+`~/.cache/nowplaying/state.json`) written by a separate now-playing daemon —
+mine is [nowplaying](https://github.com/kitslayer/nowplaying), which
+fingerprints audio and pulls synced lyrics from LRCLIB.
 It only needs a handful of keys — `title`, `artist`, `playing`, `duration`,
 `cover_file`, `lyrics_synced`, a `[[timestamp, text], ...]` lyrics list, and
 an *anchor* pair (`anchor_wall`, `anchor_pos`) giving track position at a
