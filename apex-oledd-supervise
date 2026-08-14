@@ -16,11 +16,29 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
 LOG="$STATE_DIR/apex-oledd.log"
 mkdir -p "$STATE_DIR"
 
+MAXLOG=1048576          # 1 MiB
+
 # Keep the log from growing without bound across reboots.
-if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt "$MAXLOG" ]; then
     mv -f "$LOG" "$LOG.1"
 fi
 exec >>"$LOG" 2>&1
+
+# Rotating only at startup is not enough: a single long run can outgrow the
+# cap on its own (one evening of retries reached 1.7 MB). Truncate in place
+# rather than renaming - the daemon's stdout is already open in append mode,
+# so writes resume at the new end of file instead of following a moved inode.
+(
+    while sleep 300; do
+        size=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$MAXLOG" ]; then
+            : >"$LOG"
+            echo "--- log truncated at $(date -Is) (exceeded $MAXLOG bytes)"
+        fi
+    done
+) &
+LOGGUARD=$!
+trap 'kill "$LOGGUARD" 2>/dev/null' EXIT
 
 fails=0
 window=$(( $(date +%s) ))

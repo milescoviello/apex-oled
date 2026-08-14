@@ -1093,7 +1093,8 @@ class Server(threading.Thread):
             now = time.time()
             return {'ok': True, 'source': self.ctx.current_source,
                     'sources': [s.name for s in self.ctx.sources if s.active(now)],
-                    'blanked': self.ctx.blanked}
+                    'blanked': self.ctx.blanked,
+                    'device_error': self.ctx.device_error}
         return {'ok': False, 'error': f'unknown command: {cmd!r}'}
 
 
@@ -1111,6 +1112,7 @@ class Context:
         self.stop = threading.Event()
         self.current_source = None
         self.blanked = False
+        self.device_error = None    # set while the panel cannot be opened
         self.notify = None
         self.sources = []
 
@@ -1196,22 +1198,40 @@ def run(args):
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: ctx.stop.set())
 
+    def log(msg):
+        if args.verbose:
+            print(msg, flush=True)
+
     dpy, last_fb = None, None
+    fails, since = 0, 0.0
     while not ctx.stop.is_set():
         now = time.time()
         try:
+            def healthy():
+                """Called once a write has actually landed on the panel.
+
+                Recovery is judged on a successful *write*, not a successful
+                open(): a half-detached device still opens fine and only fails
+                at the ioctl, which flapped back/unavailable once per retry.
+                """
+                nonlocal fails
+                if fails:
+                    log(f'device back after {fails} attempts '
+                        f'({time.time() - since:.0f}s without it): {dpy.path}')
+                fails, ctx.device_error = 0, None
+
             if dpy is None:
                 dpy = apex.Display(args.device)
                 last_fb = None
-                if args.verbose:
-                    print(f'opened {dpy.path}', flush=True)
+                if not fails:
+                    log(f'opened {dpy.path}')
 
             if ctx.should_blank():
                 if not ctx.blanked:
                     dpy.blank()
+                    healthy()
                     last_fb, ctx.blanked = None, True
-                    if args.verbose:
-                        print('blanked (session locked/idle)', flush=True)
+                    log('blanked (session locked/idle)')
                 ctx.stop.wait(1.0)
                 continue
             ctx.blanked = False
@@ -1220,8 +1240,8 @@ def run(args):
             if src is None:
                 ctx.stop.wait(0.5)
                 continue
-            if args.verbose and src.name != ctx.current_source:
-                print(f'source -> {src.name}', flush=True)
+            if src.name != ctx.current_source:
+                log(f'source -> {src.name}')
             ctx.current_source = src.name
 
             frame = src.render(now)
@@ -1230,17 +1250,30 @@ def run(args):
                 if fb != last_fb:          # skip identical redraws
                     dpy.send(fb)
                     last_fb = fb
+                    healthy()
             ctx.stop.wait(1.0 / src.fps)
         except (OSError, RuntimeError) as e:
-            if args.verbose:
-                print(f'device lost ({e}); retrying', flush=True)
+            # Log the transition, not every retry. Logging each attempt at a
+            # flat 2s produced 19k identical lines (1.7 MB) over one evening
+            # with the keyboard unplugged. After the first message this stays
+            # quiet and only reports again at widening intervals.
+            if fails == 0:
+                since = now
+                log(f'device unavailable ({e}); retrying quietly')
+            elif fails in (30, 300, 3000):
+                log(f'still no device after {fails} attempts '
+                    f'({(now - since) / 60:.0f} min)')
+            fails += 1
+            ctx.device_error = str(e)
             if dpy is not None:
                 try:
                     dpy.close()
                 except OSError:
                     pass
             dpy = None
-            ctx.stop.wait(2.0)
+            # Back off 2s -> 30s: a keyboard that is unplugged for the evening
+            # does not need probing every two seconds.
+            ctx.stop.wait(min(2.0 * 2 ** min(fails - 1, 4), 30.0))
 
     ctx.s.close()
     if dpy is not None:

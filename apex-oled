@@ -384,7 +384,12 @@ def cmd_info(sink, args):
     print(f'report      : {FB_LEN + 2}-byte feature report, cmd 0x{CMD:02X}')
     print(f'truetype    : {"yes" if scalable else "NO - Pillow lacks freetype; "
                            "run: euse -E truetype && emerge -1 dev-python/pillow"}')
-    if status:
+    if status and status.get('device_error'):
+        # Daemon alive but with no panel to draw on - previously this was only
+        # discoverable by reading the log.
+        print(f'daemon      : running, but CANNOT REACH THE PANEL')
+        print(f'              {status["device_error"]}')
+    elif status:
         print(f'daemon      : running, showing {status.get("source")!r}'
               f'{" (blanked)" if status.get("blanked") else ""}')
         print(f'              active sources: {", ".join(status.get("sources", []))}')
