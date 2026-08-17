@@ -367,6 +367,117 @@ def t_pause_reset():
         os.unlink(path)
 
 
+def _qwen(status, gen_seen=0.0):
+    """A QwenSource with its poller disabled and a status injected."""
+    import threading
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    ctx.stop.set()                      # the poll thread exits immediately
+    src = oledd.QwenSource(ctx)
+    src._status = status
+    src._gen_seen = gen_seen
+    return src
+
+
+@check('QwenSource yields when the stack is idle, claims the screen when busy')
+def t_qwen_gating():
+    import time
+    now = time.time()
+    base = {'model_up': True, 'proxy_up': True, 'ctx_size': 229376,
+            'gen_tok_s': 99.9, 'gpu': {}, 'ts': now,
+            'prefill': {'tokens_done': 10, 'fraction': 1.0, 'complete': True}}
+    cases = [
+        ('idle, generation long ago', {**base}, 0.0, False),
+        ('prefill in progress',
+         {**base, 'prefill': {**base['prefill'], 'complete': False}}, 0.0, True),
+        ('model down', {**base, 'model_up': False}, 0.0, True),
+        ('generation just finished', {**base}, now, True),
+        ('no prefill yet', {**base, 'prefill': None}, 0.0, False),
+        ('status unavailable', None, 0.0, False),
+    ]
+    for name, st, seen, want in cases:
+        got = _qwen(st, seen).active(now)
+        if got != want:
+            raise AssertionError(f'{name}: active={got}, want {want}')
+
+
+@check('QwenSource fires on a prefill completing, not on a wobbling rate')
+def t_qwen_completion_trigger():
+    import time
+    now = time.time()
+    src = _qwen(None)
+    busy = {'model_up': True, 'ctx_size': 1, 'gpu': {}, 'gen_tok_s': 24.9,
+            'prefill': {'complete': False, 'fraction': 0.5}}
+    done = {**busy, 'prefill': {'complete': True, 'fraction': 1.0}}
+
+    # a rolling gen_tok_s that merely wobbles must not look like fresh output;
+    # this ping-ponged with the lyrics view every 10s in practice
+    src._status, src._prev_complete = done, True
+    for rate in (24.9, 24.3, 99.9, 24.3):
+        src._status = {**done, 'gen_tok_s': rate}
+        pf = src._status['prefill']
+        complete = bool(pf.get('complete'))
+        if complete and src._prev_complete is False:
+            src._gen_seen = time.time()
+        src._prev_complete = complete
+    eq(src.active(now), False, 'wobbling gen_tok_s must not activate')
+
+    # a real False -> True completion is news
+    src._prev_complete = False
+    pf = done['prefill']
+    if pf['complete'] and src._prev_complete is False:
+        src._gen_seen = time.time()
+    src._prev_complete = True
+    src._status = done
+    eq(src.active(time.time()), True, 'prefill completing activates')
+
+
+@check('QwenSource survives nulls and junk without crashing')
+def t_qwen_null_safe():
+    import time
+    now = time.time()
+    for name, st in (
+            ('all nulls', {'model_up': True, 'proxy_up': True, 'ctx_size': None,
+                           'prefill': None, 'gen_tok_s': None, 'gpu': None,
+                           'ts': now}),
+            ('empty dict', {}),
+            ('partial prefill', {'model_up': True, 'ctx_size': 229376,
+                                 'prefill': {'complete': False}, 'gpu': None}),
+            ('zero ctx', {'model_up': True, 'ctx_size': 0, 'prefill': None,
+                          'gen_tok_s': 0.0, 'gpu': {}}),
+    ):
+        img = _qwen(st).render(now)
+        if img is not None:
+            eq(img.size, (W, H), f'{name} frame size')
+
+
+@check('QwenSource treats a failing qwen-status as "no idea", not a crash')
+def t_qwen_command_failure():
+    import time
+    ctx = _Ctx()
+    import threading
+    ctx.stop = threading.Event()
+    ctx.stop.set()
+    ctx.cfg['qwen']['command'] = '/nonexistent/qwen-status-missing'
+    src = oledd.QwenSource(ctx)
+    src._poll_once()                    # must not raise
+    eq(src._status, None, 'status after a failed command')
+    eq(src.active(time.time()), False, 'inactive when status is unknown')
+    eq(src.render(time.time()), None, 'renders nothing when status is unknown')
+
+
+@check('si_k / short_secs format for a 128px panel')
+def t_formatters():
+    eq(oledd.si_k(999), '999', 'sub-thousand')
+    eq(oledd.si_k(200759), '201k', 'thousands')
+    eq(oledd.si_k(2_400_000), '2.4M', 'millions')
+    eq(oledd.short_secs(34), '34s', 'seconds')
+    eq(oledd.short_secs(0), '0s', 'zero')
+    eq(oledd.short_secs(-5), '0s', 'negative clamps')
+    eq(oledd.short_secs(154), '2m34s', 'minutes and seconds')
+    eq(oledd.short_secs(3700), '1h01m', 'hours')
+
+
 @check('NotifySource expires its frame')
 def t_notify_expiry():
     import time
@@ -377,6 +488,65 @@ def t_notify_expiry():
     n.push(Image.new('1', (W, H), 0), 0.5)
     eq(n.active(now), True, 'just pushed')
     eq(n.active(now + 5), False, 'after expiry')
+
+
+@check('hotkey bindings parse into evdev codes')
+def t_hotkey_bindings():
+    import threading
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    ctx.cfg['hotkeys'] = {'enabled': True, 'modifier': 'rightmeta',
+                          'bindings': {'o': 'cycle', 'F1': 'mode:idle',
+                                       'nonsense': 'mode:idle', '9': 'blank'}}
+    h = oledd.Hotkeys(ctx, lambda a: None)
+    eq(h.mod, 126, 'rightmeta code')
+    eq(h.bindings.get(24), 'cycle', 'o -> KEY_O(24)')
+    eq(h.bindings.get(59), 'mode:idle', 'F1 -> KEY_F1(59), case-insensitive')
+    eq(h.bindings.get(10), 'blank', '9 -> KEY_9(10)')
+    eq(len(h.bindings), 3, 'unknown key names are dropped, not fatal')
+    # left vs right meta must not collapse to the same code
+    ctx.cfg['hotkeys']['modifier'] = 'leftmeta'
+    eq(oledd.Hotkeys(ctx, lambda a: None).mod, 125, 'leftmeta code')
+
+
+@check('hotkey actions cycle, pin and blank')
+def t_hotkey_actions():
+    import threading
+    from PIL import Image
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    ctx.stop.set()
+    ctx.forced_mode, ctx.blank_override = None, False
+    ctx.render_lines = lambda *a, **k: Image.new('1', (W, H), 0)
+    ctx.notify = oledd.NotifySource(ctx)
+
+    class Fake:
+        def __init__(self, n):
+            self.name = n
+    ctx.sources = [ctx.notify] + [Fake(n) for n in ('game', 'qwen', 'lyrics', 'idle')]
+    h = oledd.make_action_handler(ctx)
+
+    seen = []
+    for _ in range(6):
+        h('cycle')
+        seen.append(ctx.forced_mode)
+    # cycles through every mode and returns to auto (None)
+    eq(seen, ['idle', 'lyrics', 'qwen', 'game', None, 'idle'], 'cycle order')
+
+    h('mode:lyrics')
+    eq(ctx.forced_mode, 'lyrics', 'pin a mode')
+    h('mode:auto')
+    eq(ctx.forced_mode, None, 'back to auto')
+    h('blank')
+    eq(ctx.blank_override, True, 'blank on')
+    h('blank')
+    eq(ctx.blank_override, False, 'blank off')
+    h('nonsense')                       # must not raise
+    eq(ctx.forced_mode, None, 'unknown action changes nothing')
+    # pinning a mode clears a manual blank, so the panel cannot get stuck dark
+    ctx.blank_override = True
+    h('mode:idle')
+    eq(ctx.blank_override, False, 'pinning a mode unblanks')
 
 
 @check('config defaults load when the file is missing or broken')

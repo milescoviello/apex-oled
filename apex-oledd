@@ -10,6 +10,7 @@ Sources, highest priority first:
 
     notify  (100)  transient frames pushed over the IPC socket by `apex-oled`
     game     (30)  thermals + swap thrash, while gamemode is active
+    qwen     (25)  local LLM prefill progress, while it is doing something
     lyrics   (20)  now playing + synced lyric line, from the nowplaying daemon
     idle      (0)  RAM/VRAM bars over CPU and GPU rows - always active
 
@@ -28,7 +29,9 @@ import json
 import math
 import os
 import signal
+import select
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -36,7 +39,7 @@ import time
 import tomllib
 from importlib.machinery import SourceFileLoader
 
-from PIL import Image, ImageDraw, ImageFont, features
+from PIL import Image, ImageDraw, ImageFont, ImageOps, features
 
 _HERE = os.path.dirname(os.path.realpath(__file__))
 apex = SourceFileLoader('apex_oled', os.path.join(_HERE, 'apex-oled')).load_module()
@@ -98,8 +101,29 @@ DEFAULTS = {
     'game': {
         'enabled': True,
     },
+    'qwen': {
+        # Local llama.cpp inference stats. Only claims the screen during a
+        # prefill, just after a generation, or when the server is down.
+        'enabled': True,
+        'command': 'qwen-status',
+    },
+    'hotkeys': {
+        # The SteelSeries key is firmware-only and never reaches the host, so
+        # right Meta stands in for it: a real key, distinct from left Meta at
+        # the evdev level, and otherwise unused.
+        'enabled': True,
+        'modifier': 'rightmeta',
+        'bindings': {
+            'o': 'cycle',           # step through the modes
+            'i': 'mode:idle',
+            'l': 'mode:lyrics',
+            'q': 'mode:qwen',
+            'a': 'mode:auto',       # back to normal arbitration
+            'b': 'blank',           # panel off/on
+        },
+    },
     'sources': {
-        'notify': 100, 'game': 30, 'lyrics': 20, 'idle': 0,
+        'notify': 100, 'game': 30, 'qwen': 25, 'lyrics': 20, 'idle': 0,
     },
 }
 
@@ -683,6 +707,158 @@ class GameSource(Source):
         return img
 
 
+def si_k(n):
+    """201k / 1.4M style short numbers - 128px has no room for 200759."""
+    n = float(n)
+    if n >= 1e6:
+        return f'{n / 1e6:.1f}M'
+    if n >= 1000:
+        return f'{n / 1000:.0f}k'
+    return f'{n:.0f}'
+
+
+def short_secs(s):
+    s = max(0, int(s))
+    if s < 60:
+        return f'{s}s'
+    if s < 3600:
+        return f'{s // 60}m{s % 60:02d}s' if s < 600 else f'{s // 60}m'
+    return f'{s // 3600}h{(s % 3600) // 60:02d}m'
+
+
+class QwenSource(Source):
+    """Local llama.cpp inference stats, chiefly prefill progress.
+
+    A large session spends minutes ingesting its prompt before emitting a
+    single token, and nothing on screen distinguishes "working" from "hung".
+    That is the state worth surfacing, so this claims the panel only while
+    something is actually happening (see active()) and yields to the lyrics
+    view the rest of the time - the stack is idle most of the day.
+
+    `qwen-status --json` is the contract; its log parsing and nvidia-smi calls
+    stay on its side of the fence. Polling happens on a thread because it is a
+    subprocess and the render loop must not block on it.
+    """
+    name = 'qwen'
+    fps = 2.0
+
+    GEN_FRESH = 10.0        # treat a finished generation as news for this long
+    BUSY_POLL = 1.0
+    IDLE_POLL = 5.0
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._status = None
+        self._gen_seen = 0.0
+        self._prev_complete = None
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _poll_once(self):
+        cmd = self.ctx.cfg['qwen'].get('command', 'qwen-status')
+        try:
+            out = subprocess.run([cmd, '--json'], capture_output=True,
+                                 text=True, timeout=10).stdout
+            st = json.loads(out)
+            if not isinstance(st, dict):
+                raise ValueError('not an object')
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Missing script, dead server, truncated log mid-restart: all mean
+            # "no idea", which must yield rather than wedge the display.
+            self._status = None
+            return
+        # "A generation just finished" is the prefill going complete, not a
+        # change in gen_tok_s. That number is a rolling figure that wobbles
+        # between samples (24.9 -> 24.3 with nothing running), and treating
+        # each wobble as news made this source seize the screen for 10s,
+        # release it, and seize it again - ping-ponging with the lyrics view.
+        pf = st.get('prefill') or {}
+        complete = bool(pf.get('complete')) if pf else None
+        if complete and self._prev_complete is False:
+            self._gen_seen = time.time()
+        self._prev_complete = complete
+        self._status = st
+
+    def _loop(self):
+        while not self.ctx.stop.is_set():
+            self._poll_once()
+            st = self._status or {}
+            pf = st.get('prefill') or {}
+            busy = (not st.get('model_up', True)) or (pf and not pf.get('complete'))
+            if self.ctx.stop.wait(self.BUSY_POLL if busy else self.IDLE_POLL):
+                break
+
+    def active(self, now):
+        if not self.ctx.cfg['qwen'].get('enabled', True):
+            return False
+        st = self._status
+        if not st:
+            return False
+        if not st.get('model_up'):
+            return True                     # a dead server is worth interrupting for
+        pf = st.get('prefill')
+        if pf and not pf.get('complete'):
+            return True                     # a prefill is genuinely in progress
+        return (now - self._gen_seen) < self.GEN_FRESH
+
+    def render(self, now):
+        st = self._status
+        if not st:
+            return None
+        f = self.ctx.fonts
+        ui = f.get(self.ctx.cfg['fonts']['ui_size'])
+        big = f.get(self.ctx.cfg['fonts']['lyric_size'])
+        img = Image.new('1', (WIDTH, HEIGHT), 0)
+        r0, r1, r2 = row_steps(ui, 3)
+
+        if not st.get('model_up'):
+            # Inverted so a dead server is unmistakable at a glance rather
+            # than being one more line of small text. Draw white-on-black as
+            # usual and flip the finished frame - drawing onto a white canvas
+            # instead renders white-on-white and inverts to a blank panel.
+            draw_centered(img, 4, 'QWEN', ui)
+            draw_centered(img, 4 + line_height(ui), 'MODEL DOWN', big)
+            return ImageOps.invert(img.convert('L')).convert('1')
+
+        pf = st.get('prefill') or {}
+        gpu = st.get('gpu') or {}
+        ctx_size = st.get('ctx_size') or 0
+
+        if pf and not pf.get('complete'):
+            frac = pf.get('fraction') or 0.0
+            draw_text(img, (3, r0), 'FILL', ui)
+            draw_centered(img, r0, f'{frac * 100:.0f}%', ui, 40, 88)
+            rate = pf.get('tok_per_s')
+            draw_right(img, 125, r0, f'{rate:.0f}/s' if rate else '--', ui)
+
+            draw_bar(img, (3, r1 + 2, 125, r1 + 9), frac)
+
+            done = pf.get('tokens_done') or 0
+            # tokens_total is derived (done/fraction) and wobbles between
+            # samples, so show the context window as the denominator instead.
+            draw_text(img, (3, r2), f'{si_k(done)}/{si_k(ctx_size)}', ui)
+            eta = pf.get('eta_s')
+            if eta is not None:
+                draw_right(img, 125, r2, f'eta {short_secs(eta)}', ui)
+            return img
+
+        # generating, or freshly finished
+        draw_text(img, (3, r0), 'QWEN', ui)
+        gen = st.get('gen_tok_s')
+        draw_right(img, 125, r0, f'{gen:.1f} t/s' if gen is not None else 'idle', ui)
+
+        if gpu:
+            draw_text(img, (3, r1), 'GPU', ui)
+            draw_centered(img, r1, f"{gpu.get('util_pct', 0)}%", ui, 30, 70)
+            draw_centered(img, r1, f"{gpu.get('power_w', 0):.0f}W", ui, 66, 102)
+            draw_right(img, 125, r1, f"{gpu.get('temp_c', 0)}c", ui)
+        done = (pf or {}).get('tokens_done')
+        if done and ctx_size:
+            draw_text(img, (3, r2), f'ctx {si_k(done)}/{si_k(ctx_size)}', ui)
+            draw_bar(img, (76, r2 + 2, 125, r2 + 9), done / ctx_size)
+        return img
+
+
 class LyricsSource(Source):
     """Now playing + the current synced lyric, from the nowplaying daemon.
 
@@ -1008,6 +1184,114 @@ class IdleSource(Source):
 # IPC
 # ---------------------------------------------------------------------------
 
+class Hotkeys(threading.Thread):
+    """Watch the keyboard for <modifier>+<key> and drive the panel with it.
+
+    Right Meta rather than the SteelSeries key: the SteelSeries key is handled
+    entirely in the keyboard's firmware and never reaches the host, so nothing
+    on this side can bind it. Right Meta is a real key, distinct from left Meta
+    at the evdev level (126 vs 125) - a distinction KDE's own shortcut config
+    cannot express - and is otherwise unused.
+
+    This only observes. Suppressing the keypress would need EVIOCGRAB, which
+    grabs the whole keyboard and would swallow all typing, so bind combinations
+    that applications ignore.
+    """
+    MODIFIERS = {'rightmeta': 126, 'leftmeta': 125, 'rightalt': 100,
+                 'rightctrl': 97, 'rightshift': 54}
+    KEYS = {
+        **{str(n): 2 + i for i, n in enumerate([1, 2, 3, 4, 5, 6, 7, 8, 9, 0])},
+        **{c: k for c, k in zip('qwertyuiop', range(16, 26))},
+        **{c: k for c, k in zip('asdfghjkl', range(30, 39))},
+        **{c: k for c, k in zip('zxcvbnm', range(44, 51))},
+        **{f'f{i}': 58 + i for i in range(1, 11)}, 'f11': 87, 'f12': 88,
+        'space': 57, 'enter': 28, 'tab': 15, 'esc': 1,
+        'up': 103, 'down': 108, 'left': 105, 'right': 106,
+    }
+    EV_KEY = 1
+    EVENT_SIZE = 24         # struct input_event on 64-bit: 16b timeval + H H i
+
+    def __init__(self, ctx, on_action):
+        super().__init__(daemon=True)
+        self.ctx = ctx
+        self.on_action = on_action
+        cfg = ctx.cfg['hotkeys']
+        self.mod = self.MODIFIERS.get(str(cfg.get('modifier', 'rightmeta')).lower())
+        self.bindings = {}
+        for key, action in (cfg.get('bindings') or {}).items():
+            code = self.KEYS.get(str(key).lower())
+            if code is not None:
+                self.bindings[code] = action
+
+    @staticmethod
+    def find_keyboard(want_code=30):
+        """The evdev node carrying ordinary keys for the Apex.
+
+        The device also exposes Consumer Control and Mouse nodes; the plain
+        keyboard one is the only one that reports KEY_A, so check the sysfs
+        capability bitmap for it rather than guessing at the node order.
+        """
+        best = None
+        for sysdir in sorted(glob.glob('/sys/class/input/event*')):
+            try:
+                if 'Apex Pro Gen 3' not in open(sysdir + '/device/name').read():
+                    continue
+                caps = open(sysdir + '/device/capabilities/key').read().split()
+            except OSError:
+                continue
+            node = '/dev/input/' + os.path.basename(sysdir)
+            best = best or node
+            # capabilities/key is 64-bit words, most significant first
+            words = [int(w, 16) for w in reversed(caps)]
+            idx, bit = divmod(want_code, 64)
+            if idx < len(words) and words[idx] >> bit & 1:
+                return node
+        return best
+
+    def run(self):
+        if not self.mod or not self.bindings:
+            return
+        held = False
+        fd = None
+        while not self.ctx.stop.is_set():
+            if fd is None:
+                node = self.find_keyboard()
+                if node is None:
+                    if self.ctx.stop.wait(5.0):
+                        break
+                    continue
+                try:
+                    fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    fd = None
+                    if self.ctx.stop.wait(5.0):
+                        break
+                    continue
+            try:
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if not r:
+                    continue
+                data = os.read(fd, 4096)
+            except OSError:
+                os.close(fd)
+                fd = None                   # unplugged; rediscover the node
+                continue
+            for i in range(0, len(data) - self.EVENT_SIZE + 1, self.EVENT_SIZE):
+                _, _, etype, code, value = struct.unpack('qqHHi',
+                                                         data[i:i + self.EVENT_SIZE])
+                if etype != self.EV_KEY:
+                    continue
+                if code == self.mod:
+                    held = value != 0
+                elif held and value == 1 and code in self.bindings:
+                    try:
+                        self.on_action(self.bindings[code])
+                    except Exception:       # a bad binding must not kill the thread
+                        pass
+        if fd is not None:
+            os.close(fd)
+
+
 class Server(threading.Thread):
     """Unix socket accepting JSON commands, one per connection.
 
@@ -1113,6 +1397,8 @@ class Context:
         self.current_source = None
         self.blanked = False
         self.device_error = None    # set while the panel cannot be opened
+        self.forced_mode = None     # source name pinned by a hotkey, or None
+        self.blank_override = False
         self.notify = None
         self.sources = []
 
@@ -1136,6 +1422,8 @@ class Context:
         return img
 
     def should_blank(self):
+        if self.blank_override:
+            return True
         d, sess = self.cfg['display'], self.s.session()
         if d.get('blank_on_lock', True) and sess.get('locked'):
             return True
@@ -1160,8 +1448,49 @@ def compose(frame, now, cfg):
 
 def build_sources(ctx):
     ctx.notify = NotifySource(ctx)
-    sources = [ctx.notify, GameSource(ctx), LyricsSource(ctx), IdleSource(ctx)]
+    sources = [ctx.notify, GameSource(ctx), QwenSource(ctx),
+               LyricsSource(ctx), IdleSource(ctx)]
     return sorted(sources, key=lambda s: -s.priority)
+
+
+# Order the `cycle` hotkey steps through. 'auto' means normal arbitration.
+CYCLE_MODES = ['auto', 'idle', 'lyrics', 'qwen', 'game']
+
+
+def make_action_handler(ctx, log=lambda m: None):
+    """Turn a hotkey action string into a change of daemon state."""
+
+    def feedback(text):
+        # Confirm on the panel itself - the keys are silent otherwise, and
+        # notify outranks everything so it shows even over a forced mode.
+        img = ctx.render_lines([text], align='center',
+                               size=ctx.cfg['fonts']['lyric_size'])
+        ctx.notify.push(img, 1.2)
+
+    def handle(action):
+        action = str(action)
+        if action == 'blank':
+            ctx.blank_override = not ctx.blank_override
+            log(f'hotkey: panel {"off" if ctx.blank_override else "on"}')
+            if not ctx.blank_override:
+                feedback('PANEL ON')
+            return
+        if action == 'cycle':
+            have = [m for m in CYCLE_MODES
+                    if m == 'auto' or any(s.name == m for s in ctx.sources)]
+            cur = ctx.forced_mode or 'auto'
+            nxt = have[(have.index(cur) + 1) % len(have)] if cur in have else 'auto'
+        elif action.startswith('mode:'):
+            nxt = action.split(':', 1)[1] or 'auto'
+        else:
+            log(f'hotkey: unknown action {action!r}')
+            return
+        ctx.forced_mode = None if nxt == 'auto' else nxt
+        ctx.blank_override = False
+        log(f'hotkey: mode -> {nxt}')
+        feedback(nxt.upper() if nxt != 'auto' else 'AUTO')
+
+    return handle
 
 
 def run(args):
@@ -1202,6 +1531,15 @@ def run(args):
         if args.verbose:
             print(msg, flush=True)
 
+    if cfg['hotkeys'].get('enabled', True):
+        keys = Hotkeys(ctx, make_action_handler(ctx, log))
+        if keys.mod and keys.bindings:
+            log(f'hotkeys: {keys.find_keyboard()} '
+                f'{cfg["hotkeys"]["modifier"]}+{",".join(sorted(k for k in cfg["hotkeys"]["bindings"]))}')
+            keys.start()
+        else:
+            log('hotkeys: nothing bound')
+
     dpy, last_fb = None, None
     fails, since = 0, 0.0
     while not ctx.stop.is_set():
@@ -1236,7 +1574,15 @@ def run(args):
                 continue
             ctx.blanked = False
 
-            src = next((s for s in ctx.sources if s.active(now)), None)
+            # notify always wins (it is the hotkey's own confirmation), then a
+            # mode pinned by a hotkey, then normal arbitration.
+            src = ctx.notify if ctx.notify.active(now) else None
+            if src is None and ctx.forced_mode:
+                src = next((s for s in ctx.sources
+                            if s.name == ctx.forced_mode), None)
+            auto = next((s for s in ctx.sources if s.active(now)), None)
+            if src is None:
+                src = auto
             if src is None:
                 ctx.stop.wait(0.5)
                 continue
@@ -1245,6 +1591,10 @@ def run(args):
             ctx.current_source = src.name
 
             frame = src.render(now)
+            if frame is None and src is not auto and auto is not None:
+                # A pinned source with nothing to draw (lyrics with no music,
+                # say) must not leave the panel frozen on a stale frame.
+                src, frame = auto, auto.render(now)
             if frame is not None:
                 fb = apex.pack(compose(frame, now, cfg))
                 if fb != last_fb:          # skip identical redraws

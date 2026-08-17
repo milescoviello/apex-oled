@@ -57,5 +57,28 @@ enabled = true
 # Priority: the highest-numbered active source owns the screen.
 notify = 100
 game = 30
+qwen = 25
 lyrics = 20
 idle = 0
+
+[hotkeys]
+# The SteelSeries key is handled entirely in the keyboard's firmware and never
+# reaches the host - verified by capture, it emits nothing on any HID or evdev
+# node. Right Meta stands in for it: a real key, reported distinctly from left
+# Meta at the evdev level (126 vs 125), a distinction KDE's own shortcut config
+# cannot express.
+#
+# This observes the keyboard, it does not grab it - suppressing the keypress
+# would need EVIOCGRAB, which would swallow all typing. So the combination
+# also reaches the focused application; bind things applications ignore.
+enabled = true
+modifier = "rightmeta"     # rightmeta | leftmeta | rightalt | rightctrl | rightshift
+
+[hotkeys.bindings]
+# action: "cycle" | "mode:<source>" | "mode:auto" | "blank"
+o = "cycle"                # step auto -> idle -> lyrics -> qwen -> game
+i = "mode:idle"
+l = "mode:lyrics"
+q = "mode:qwen"
+a = "mode:auto"            # back to normal arbitration
+b = "blank"                # panel off/on
