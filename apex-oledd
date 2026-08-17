@@ -106,6 +106,9 @@ DEFAULTS = {
         # prefill, just after a generation, or when the server is down.
         'enabled': True,
         'command': 'qwen-status',
+        # Real context occupancy. prefill.tokens_done is only the incremental
+        # prefill, so it cannot answer "how full is the window".
+        'slots_url': 'http://127.0.0.1:8090/slots',
     },
     'hotkeys': {
         # The SteelSeries key is firmware-only and never reaches the host, so
@@ -768,10 +771,35 @@ class QwenSource(Source):
         self._status = None
         self._gen_seen = 0.0
         self._prev_complete = None
+        self._ctx_used = None       # (tokens resident, n_ctx) from /slots
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def _poll_slots(self):
+        """True context occupancy, straight from llama-server.
+
+        `prefill.tokens_done` is the *incremental* prefill: with prompt
+        caching a 210k-token conversation can report 979, because only 979
+        tokens were new. That makes it useless as "how full is the window" -
+        it read 0.4% while the window was 92% full. /slots reports
+        n_prompt_tokens, which is the whole prompt actually resident.
+        """
+        url = self.ctx.cfg['qwen'].get('slots_url')
+        if not url:
+            return
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=3) as r:
+                slots = json.load(r)
+            slot = (slots if isinstance(slots, list) else [slots])[0]
+            used, total = slot.get('n_prompt_tokens'), slot.get('n_ctx')
+            if used is not None and total:
+                self._ctx_used = (used, total)
+        except Exception:
+            pass            # server down or endpoint absent: fall back below
+
     def _poll_once(self):
+        self._poll_slots()
         cmd = self.ctx.cfg['qwen'].get('command', 'qwen-status')
         try:
             out = subprocess.run([cmd, '--json'], capture_output=True,
@@ -851,9 +879,12 @@ class QwenSource(Source):
             draw_bar(img, (3, r1 + 2, 125, r1 + 9), frac)
 
             done = pf.get('tokens_done') or 0
-            # tokens_total is derived (done/fraction) and wobbles between
-            # samples, so show the context window as the denominator instead.
-            draw_text(img, (3, r2), f'{si_k(done)}/{si_k(ctx_size)}', ui)
+            # This prefill's own workload, not the window: with prompt caching
+            # only the uncached tail gets processed, so "979/229k" would be
+            # nonsense. tokens_total is derived and wobbles a little, which is
+            # fine at this precision.
+            total = pf.get('tokens_total') or ctx_size
+            draw_text(img, (3, r2), f'{si_k(done)}/{si_k(total)}', ui)
             eta = pf.get('eta_s')
             if eta is not None:
                 draw_right(img, 125, r2, f'eta {short_secs(eta)}', ui)
@@ -869,10 +900,12 @@ class QwenSource(Source):
             draw_centered(img, r1, f"{gpu.get('util_pct', 0)}%", ui, 30, 70)
             draw_centered(img, r1, f"{gpu.get('power_w', 0):.0f}W", ui, 66, 102)
             draw_right(img, 125, r1, f"{gpu.get('temp_c', 0)}c", ui)
-        done = (pf or {}).get('tokens_done')
-        if done and ctx_size:
-            draw_text(img, (3, r2), f'ctx {si_k(done)}/{si_k(ctx_size)}', ui)
-            draw_bar(img, (76, r2 + 2, 125, r2 + 9), done / ctx_size)
+        used, total = self._ctx_used or (None, None)
+        if used is None:                    # /slots unavailable
+            used, total = (pf or {}).get('tokens_done'), ctx_size
+        if used and total:
+            draw_text(img, (3, r2), f'ctx {si_k(used)}/{si_k(total)}', ui)
+            draw_bar(img, (76, r2 + 2, 125, r2 + 9), used / total)
         return img
 
 

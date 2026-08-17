@@ -61,6 +61,16 @@ qwen = 25
 lyrics = 20
 idle = 0
 
+[qwen]
+# Local llama.cpp inference stats. Only claims the screen during a prefill,
+# just after one completes, or when the server is down.
+enabled = true
+command = "qwen-status"
+# Real context occupancy. prefill.tokens_done is only the *incremental*
+# prefill - with prompt caching a 210k-token conversation reports ~979 - so it
+# cannot answer "how full is the window". /slots reports n_prompt_tokens.
+slots_url = "http://127.0.0.1:8090/slots"
+
 [hotkeys]
 # The SteelSeries key is handled entirely in the keyboard's firmware and never
 # reaches the host - verified by capture, it emits nothing on any HID or evdev
