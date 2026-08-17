@@ -432,6 +432,59 @@ def t_qwen_completion_trigger():
     eq(src.active(time.time()), True, 'prefill completing activates')
 
 
+@check('live decode rate comes from n_decoded deltas, not the stale average')
+def t_qwen_live_rate():
+    import io
+    import json as _json
+    import threading
+    import urllib.request
+
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    ctx.stop.set()
+    ctx.cfg['qwen']['slots_url'] = 'http://stub/slots'
+    src = oledd.QwenSource(ctx)
+
+    clock = [1000.0]
+    real_time, real_open = oledd.time.time, urllib.request.urlopen
+    slot = {'n_prompt_tokens': 210000, 'n_ctx': 229376, 'is_processing': True,
+            'next_token': [{'n_decoded': 0}]}
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_open(*a, **k):
+        return Resp(_json.dumps([slot]).encode())
+
+    oledd.time.time = lambda: clock[0]
+    urllib.request.urlopen = fake_open
+    try:
+        # 20 tokens per second, sampled once a second
+        for i in range(5):
+            slot['next_token'][0]['n_decoded'] = i * 20
+            clock[0] = 1000.0 + i
+            src._poll_slots()
+        if not (18 <= src._live_tps <= 22):
+            raise AssertionError(f'expected ~20 tok/s, got {src._live_tps}')
+        eq(src._ctx_used, (210000, 229376), 'context occupancy')
+
+        # a new turn restarts the count; the stale rate must be dropped
+        slot['next_token'][0]['n_decoded'] = 3
+        clock[0] += 1
+        src._poll_slots()
+        eq(src._live_tps, None, 'rate cleared when n_decoded goes backwards')
+
+        # once the turn ends there is no live rate at all
+        slot['is_processing'] = False
+        clock[0] += 1
+        src._poll_slots()
+        eq(src._live_tps, None, 'no live rate while idle')
+    finally:
+        oledd.time.time = real_time
+        urllib.request.urlopen = real_open
+
+
 @check('QwenSource survives nulls and junk without crashing')
 def t_qwen_null_safe():
     import time

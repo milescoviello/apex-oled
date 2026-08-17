@@ -772,6 +772,9 @@ class QwenSource(Source):
         self._gen_seen = 0.0
         self._prev_complete = None
         self._ctx_used = None       # (tokens resident, n_ctx) from /slots
+        self._processing = False    # a turn is in flight
+        self._decode = None         # (t, n_decoded) for the live rate
+        self._live_tps = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -795,6 +798,26 @@ class QwenSource(Source):
             used, total = slot.get('n_prompt_tokens'), slot.get('n_ctx')
             if used is not None and total:
                 self._ctx_used = (used, total)
+            self._processing = bool(slot.get('is_processing'))
+
+            # Live decode rate. The status contract says none is available,
+            # but /slots carries n_decoded for the in-flight turn, and
+            # differencing it gives the real current speed - which is what
+            # you want mid-generation. gen_tok_s is the previous turn's
+            # average and can be minutes stale.
+            n = ((slot.get('next_token') or [{}])[0] or {}).get('n_decoded')
+            now = time.time()
+            prev, self._decode = self._decode, (now, n)
+            if n is None or not self._processing:
+                self._decode = self._live_tps = None
+            elif prev and prev[1] is not None and now > prev[0]:
+                if n < prev[1]:
+                    self._live_tps = None       # a new turn began
+                elif n > prev[1]:
+                    r = (n - prev[1]) / (now - prev[0])
+                    # Smoothed: raw samples swing 18-25 tok/s between ticks.
+                    self._live_tps = r if self._live_tps is None else (
+                        0.6 * self._live_tps + 0.4 * r)
         except Exception:
             pass            # server down or endpoint absent: fall back below
 
@@ -829,7 +852,8 @@ class QwenSource(Source):
             self._poll_once()
             st = self._status or {}
             pf = st.get('prefill') or {}
-            busy = (not st.get('model_up', True)) or (pf and not pf.get('complete'))
+            busy = ((not st.get('model_up', True)) or self._processing
+                    or (pf and not pf.get('complete')))
             if self.ctx.stop.wait(self.BUSY_POLL if busy else self.IDLE_POLL):
                 break
 
@@ -841,6 +865,8 @@ class QwenSource(Source):
             return False
         if not st.get('model_up'):
             return True                     # a dead server is worth interrupting for
+        if self._processing:
+            return True                     # prefilling or generating right now
         pf = st.get('prefill')
         if pf and not pf.get('complete'):
             return True                     # a prefill is genuinely in progress
@@ -893,7 +919,14 @@ class QwenSource(Source):
         # generating, or freshly finished
         draw_text(img, (3, r0), 'QWEN', ui)
         gen = st.get('gen_tok_s')
-        draw_right(img, 125, r0, f'{gen:.1f} t/s' if gen is not None else 'idle', ui)
+        if self._live_tps:
+            rate = f'{self._live_tps:.1f} t/s'
+        elif gen is not None:
+            # "last" so a stale average never masquerades as the current speed
+            rate = f'{gen:.0f} t/s last'
+        else:
+            rate = 'idle'
+        draw_right(img, 125, r0, rate, ui)
 
         if gpu:
             draw_text(img, (3, r1), 'GPU', ui)
