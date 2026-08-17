@@ -376,6 +376,23 @@ def cmd_watch(sink, args):
         pass
 
 
+def cmd_mode(sink, args):
+    """Switch what the daemon shows. Needs the daemon; there is nothing to
+    switch without it."""
+    action = 'cycle' if args.cycle else f'mode:{args.name or "auto"}'
+    reply = daemon_send({'cmd': 'action', 'action': action})
+    if reply is None:
+        sys.exit('apex-oled: daemon not running')
+    print(f'mode: {reply.get("mode")}')
+
+
+def cmd_blank(sink, args):
+    reply = daemon_send({'cmd': 'action', 'action': 'blank'})
+    if reply is None:
+        sys.exit('apex-oled: daemon not running')
+    print(f'panel: {"off" if reply.get("blanked") else "on"}')
+
+
 def cmd_info(sink, args):
     font, scalable = load_font(13)
     status = daemon_send({'cmd': 'status'})
@@ -452,6 +469,13 @@ def main():
     s = add('watch', 'repeatedly run a command and show its output', cmd_watch)
     s.add_argument('command')
     s.add_argument('--interval', type=float, default=2.0)
+
+    s = add('mode', 'switch which view the daemon shows', cmd_mode)
+    s.add_argument('name', nargs='?',
+                   help='idle | lyrics | qwen | game | auto')
+    s.add_argument('--cycle', action='store_true', help='step to the next mode')
+
+    add('blank', 'toggle the panel off/on', cmd_blank)
 
     add('info', 'report device and capabilities', cmd_info)
 

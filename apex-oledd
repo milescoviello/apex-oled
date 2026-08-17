@@ -672,6 +672,14 @@ class GameSource(Source):
     name = 'game'
     fps = 2.0
 
+    SWAP_ON = 0.05          # MiB/s that counts as "we are paging"
+    SWAP_HOLD = 10.0        # keep the swap row this long after the last burst
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._swap_until = 0.0
+        self._swap_peak = 0.0
+
     def active(self, now):
         return self.ctx.cfg['game'].get('enabled', True) and self.ctx.s.gamemode()
 
@@ -694,11 +702,20 @@ class GameSource(Source):
 
         # The payoff line: sustained swap traffic is the stutter you cannot
         # otherwise see, so it takes the row whenever it is happening.
+        # Latched, not instantaneous: paging is bursty, and testing the rate
+        # directly flipped this row against the RAM bar twice a second.
         rate = s.swap_rate()
-        if rate and (rate[0] > 0.05 or rate[1] > 0.05):
+        if rate and (rate[0] > self.SWAP_ON or rate[1] > self.SWAP_ON):
+            self._swap_until = now + self.SWAP_HOLD
+            self._swap_peak = max(self._swap_peak, rate[0], rate[1])
+        if now >= self._swap_until:
+            self._swap_peak = 0.0
+        if now < self._swap_until:
+            rate = rate or (0.0, 0.0)
             draw_text(img, (3, r2), 'SWAP', ui)
-            draw_right(img, 125, r2,
-                       f'{rate[0]:.0f}/{rate[1]:.0f} MB/s', ui)
+            # Peak rather than instantaneous: the number is unreadable if it
+            # redraws from a fresh sample twice a second.
+            draw_right(img, 125, r2, f'peak {self._swap_peak:.0f} MB/s', ui)
         else:
             mem = s.mem()
             if mem:
@@ -1373,6 +1390,15 @@ class Server(threading.Thread):
         if cmd == 'clear':
             notify.clear()
             return {'ok': True}
+        if cmd == 'action':
+            # Same actions the hotkey listener drives, reachable from the CLI
+            # so a desktop shortcut (which *can* suppress the keypress) works.
+            act = msg.get('action')
+            if not act:
+                return {'ok': False, 'error': 'no action given'}
+            self.ctx.do_action(act)
+            return {'ok': True, 'mode': self.ctx.forced_mode or 'auto',
+                    'blanked': self.ctx.blank_override}
         if cmd == 'status':
             now = time.time()
             return {'ok': True, 'source': self.ctx.current_source,
@@ -1399,6 +1425,7 @@ class Context:
         self.device_error = None    # set while the panel cannot be opened
         self.forced_mode = None     # source name pinned by a hotkey, or None
         self.blank_override = False
+        self.do_action = lambda action: None    # set once sources exist
         self.notify = None
         self.sources = []
 
@@ -1531,8 +1558,9 @@ def run(args):
         if args.verbose:
             print(msg, flush=True)
 
+    ctx.do_action = make_action_handler(ctx, log)
     if cfg['hotkeys'].get('enabled', True):
-        keys = Hotkeys(ctx, make_action_handler(ctx, log))
+        keys = Hotkeys(ctx, ctx.do_action)
         if keys.mod and keys.bindings:
             log(f'hotkeys: {keys.find_keyboard()} '
                 f'{cfg["hotkeys"]["modifier"]}+{",".join(sorted(k for k in cfg["hotkeys"]["bindings"]))}')
