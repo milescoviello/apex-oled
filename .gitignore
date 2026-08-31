@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.png
 !docs/*.png
+
+# packed frame files are large and usually derived from media you own
+*.fb

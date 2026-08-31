@@ -11,6 +11,7 @@ Sources, highest priority first:
     notify  (100)  transient frames pushed over the IPC socket by `apex-oled`
     game     (30)  thermals + swap thrash, while gamemode is active
     qwen     (25)  local LLM prefill progress, while it is doing something
+    video    (22)  a packed frame file, synced to a matching now-playing track
     lyrics   (20)  now playing + synced lyric line, from the nowplaying daemon
     idle      (0)  RAM/VRAM bars over CPU and GPU rows - always active
 
@@ -101,6 +102,15 @@ DEFAULTS = {
     'game': {
         'enabled': True,
     },
+    'video': {
+        # Play a packed frame file in sync when a matching track is playing.
+        # Keys are matched case-insensitively against the track title.
+        'enabled': True,
+        'fps': 30.0,
+        'offset': 0.0,
+        # 'substring of the track title': 'path to packed frames'
+        'tracks': {},
+    },
     'qwen': {
         # Local llama.cpp inference stats. Only claims the screen during a
         # prefill, just after a generation, or when the server is down.
@@ -126,7 +136,8 @@ DEFAULTS = {
         },
     },
     'sources': {
-        'notify': 100, 'game': 30, 'qwen': 25, 'lyrics': 20, 'idle': 0,
+        'notify': 100, 'game': 30, 'video': 28, 'qwen': 25, 'lyrics': 20,
+        'idle': 0,
     },
 }
 
@@ -942,6 +953,98 @@ class QwenSource(Source):
         return img
 
 
+class VideoSource(Source):
+    """Play a packed frame file in sync with a track, when that track plays.
+
+    The point of doing this in the daemon rather than with `apex-oled play` is
+    that nowplaying publishes an *anchored* position, so the frame index comes
+    from the track clock rather than a local one. It therefore stays in sync
+    across pause, resume and seeking, instead of drifting the moment you touch
+    the transport.
+
+    render() returns a raw framebuffer rather than an image: the frames are
+    already packed on disk, and unpacking only to repack them would be silly.
+    """
+    name = 'video'
+    fps = 30.0
+
+    def __init__(self, ctx, state_path=NOWPLAYING_STATE):
+        super().__init__(ctx)
+        self.state_path = state_path
+        self._state, self._mtime, self._checked = {}, 0.0, 0.0
+        self._maps = {}         # path -> (mmap, frame count)
+        self._match = None      # (fb path, fps) for the current track
+
+    def _load(self, now):
+        if now - self._checked < 0.25:
+            return self._state
+        self._checked = now
+        try:
+            m = os.path.getmtime(self.state_path)
+            if m != self._mtime:
+                with open(self.state_path) as f:
+                    self._state = json.load(f)
+                self._mtime = m
+        except (OSError, ValueError):
+            self._state = {}
+        return self._state
+
+    def _frames(self, path):
+        """mmap the frame file - 4 MB per video is not worth resident memory."""
+        if path not in self._maps:
+            import mmap
+            try:
+                f = open(path, 'rb')
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                self._maps[path] = (mm, len(mm) // apex.FB_LEN)
+            except (OSError, ValueError):
+                self._maps[path] = (None, 0)
+        return self._maps[path]
+
+    def _lookup(self, st):
+        """First configured track whose name appears in the title."""
+        title = (st.get('title') or '').lower()
+        if not title:
+            return None
+        for needle, path in (self.ctx.cfg['video'].get('tracks') or {}).items():
+            if needle.lower() in title:
+                path = os.path.expanduser(path)
+                if os.path.exists(path):
+                    return path
+        return None
+
+    def active(self, now):
+        cfg = self.ctx.cfg['video']
+        if not cfg.get('enabled', True):
+            return False
+        st = self._load(now)
+        if not st or not st.get('playing'):
+            return False
+        written = st.get('written_at', 0)
+        if written and now - written > STATE_STALE_AFTER:
+            return False
+        self._match = self._lookup(st)
+        return self._match is not None
+
+    def render(self, now):
+        if not self._match:
+            return None
+        mm, count = self._frames(self._match)
+        if not count:
+            return None
+        st = self._state
+        pos = st.get('anchor_pos', 0.0)
+        if st.get('playing'):
+            pos += now - st.get('anchor_wall', now)
+        # Offset lets a video be aligned against a track that has a different
+        # intro length to the source it was ripped from.
+        pos += float(self.ctx.cfg['video'].get('offset', 0.0))
+        i = int(pos * float(self.ctx.cfg['video'].get('fps', 30.0)))
+        if i < 0 or i >= count:
+            return None                 # before the start or past the end
+        return bytes(mm[i * apex.FB_LEN:(i + 1) * apex.FB_LEN])
+
+
 class LyricsSource(Source):
     """Now playing + the current synced lyric, from the nowplaying daemon.
 
@@ -1456,6 +1559,16 @@ class Server(threading.Thread):
         if cmd == 'clear':
             notify.clear()
             return {'ok': True}
+        if cmd == 'release':
+            # Hand the panel to another process (an animation player wants to
+            # write at full rate without the daemon redrawing over it). Time
+            # limited so a crashed client cannot keep the screen forever.
+            secs = float(msg.get('secs', 30.0))
+            self.ctx.released_until = time.time() + max(0.0, min(secs, 1800.0))
+            return {'ok': True, 'released_for': secs}
+        if cmd == 'resume':
+            self.ctx.released_until = 0.0
+            return {'ok': True}
         if cmd == 'action':
             # Same actions the hotkey listener drives, reachable from the CLI
             # so a desktop shortcut (which *can* suppress the keypress) works.
@@ -1492,6 +1605,7 @@ class Context:
         self.forced_mode = None     # source name pinned by a hotkey, or None
         self.blank_override = False
         self.do_action = lambda action: None    # set once sources exist
+        self.released_until = 0.0   # panel handed to another process until then
         self.notify = None
         self.sources = []
 
@@ -1542,7 +1656,7 @@ def compose(frame, now, cfg):
 def build_sources(ctx):
     ctx.notify = NotifySource(ctx)
     sources = [ctx.notify, GameSource(ctx), QwenSource(ctx),
-               LyricsSource(ctx), IdleSource(ctx)]
+               VideoSource(ctx), LyricsSource(ctx), IdleSource(ctx)]
     return sorted(sources, key=lambda s: -s.priority)
 
 
@@ -1652,6 +1766,20 @@ def run(args):
                         f'({time.time() - since:.0f}s without it): {dpy.path}')
                 fails, ctx.device_error = 0, None
 
+            if now < ctx.released_until:
+                # Another process owns the panel; drop our handle so it can
+                # write, and idle until the lease expires. Checked before the
+                # open below, or we would open and close once per tick.
+                if dpy is not None:
+                    try:
+                        dpy.close()
+                    except OSError:
+                        pass
+                    dpy, last_fb = None, None
+                    log('panel released to another process')
+                ctx.stop.wait(0.25)
+                continue
+
             if dpy is None:
                 dpy = apex.Display(args.device)
                 last_fb = None
@@ -1690,7 +1818,11 @@ def run(args):
                 # say) must not leave the panel frozen on a stale frame.
                 src, frame = auto, auto.render(now)
             if frame is not None:
-                fb = apex.pack(compose(frame, now, cfg))
+                # Sources may return a ready-made framebuffer (video frames are
+                # packed on disk); those skip compose, since full-motion video
+                # needs no burn-in shift.
+                fb = (frame if isinstance(frame, (bytes, bytearray))
+                      else apex.pack(compose(frame, now, cfg)))
                 if fb != last_fb:          # skip identical redraws
                     dpy.send(fb)
                     last_fb = fb

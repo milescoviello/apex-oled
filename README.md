@@ -102,11 +102,27 @@ producers don't race to be the last writer:
 |---|---|---|
 | `notify` | 100 | transient frames pushed by the CLI over a unix socket |
 | `game` | 30 | GPU/CPU load and temps, plus **swap in/out**, while gamemode runs |
+| `video` | 28 | packed frames synced to a matching now-playing track |
+| `qwen` | 25 | local llama.cpp prefill progress, live decode rate, context bar |
 | `lyrics` | 20 | current synced lyric, else a now-playing card |
 | `idle` | 0 | RAM/VRAM capacity bars over CPU and GPU rows |
 
 While the daemon runs, CLI writes route through it as expiring top-priority
 frames (`--notify SECS`, default 5). `--direct` bypasses it.
+
+Switch what it shows, from a shell or a desktop shortcut:
+
+```bash
+apex-oled mode --cycle          # auto -> idle -> lyrics -> qwen -> game
+apex-oled mode lyrics
+apex-oled blank
+```
+
+There is also an evdev hotkey listener (`[hotkeys]`, off by default). It can
+key on right Meta specifically - which evdev distinguishes from left Meta and
+desktop shortcut editors generally do not - but it can only *observe* the
+keyboard, so the bound key still reaches the focused window. A compositor
+shortcut running the commands above is the only way to actually swallow it.
 
 Adding a source is a subclass with `active()` and `render()`:
 
@@ -137,6 +153,36 @@ wall-clock instant. Position is interpolated locally from that anchor, so the
 display stays smooth without polling anything. Point `NOWPLAYING_STATE` at
 whatever writes that shape.
 
+## Animation
+
+Any video can be pre-packed into raw frames and played back:
+
+```bash
+tools/video2fb clip.mp4 clip.fb --fit height   # or width / stretch
+apex-oled play clip.fb --loop
+```
+
+`play` asks the daemon to stand down for the duration and hands the panel back
+afterwards, including on Ctrl-C. The lease is time-limited, so a player that
+dies cannot keep the screen.
+
+The `video` source goes further: point it at a track title and it plays the
+frames *in sync with playback*, indexing them by the now-playing anchor rather
+than a local clock, so it follows pause, resume and seeking instead of
+drifting.
+
+```toml
+[video.tracks]
+"some song" = "~/.local/share/apex-oled/somesong.fb"
+```
+
+Frames are 640 bytes each - about 4 MB per three-minute clip at 30fps - and
+`mmap`ed rather than held resident.
+
+## Doom
+
+Yes. See [tools/doom](tools/doom/).
+
 ## Design notes
 
 Things learned the hard way on a 128×40 one-bit panel:
@@ -153,6 +199,10 @@ Things learned the hard way on a 128×40 one-bit panel:
   Covers are sharpened at target size first, because downscaling to 34px
   destroys the edges 1-bit output depends on. Dithering loses to thresholding
   at this scale every time: speckle reads as noise.
+- **Throughput is not the limit; tearing is.** The panel accepts frames at
+  ~989 fps (1.01 ms each, one USB frame interval), but it refreshes as a
+  rolling scan, so writing faster than the scan just overwrites rows midway
+  through being drawn. 30 fps is plenty.
 - **Burn-in is real.** The frame walks a slow ±2px orbit and the panel blanks
   when the session locks.
 
@@ -162,12 +212,13 @@ the panel — that's how to iterate on layout without squinting at a keyboard.
 ## Tests
 
 ```bash
-apex-oled-test          # 20 checks, no keyboard required
+apex-oled-test          # 28 checks, no keyboard required
 ```
 
 Covers the packing against a slow reference implementation, a pack/unpack
 round trip, balanced wrapping, truncation, bar edge cases, Otsu on dark and
-bright histograms, source activation, and config fallback.
+bright histograms, source activation and gating, hotkey binding and actions,
+the live decode rate, and config fallback.
 
 ## Prior art
 

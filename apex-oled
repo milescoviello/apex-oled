@@ -393,6 +393,66 @@ def cmd_blank(sink, args):
     print(f'panel: {"off" if reply.get("blanked") else "on"}')
 
 
+def cmd_play(sink, args):
+    """Play a stream of pre-packed 640-byte framebuffers.
+
+    Frames are pushed straight to the panel rather than through the daemon:
+    the daemon redraws on its own schedule, so animation has to own the
+    device. It is asked to stand down for the duration (and told to resume
+    afterwards, including on Ctrl-C) rather than being killed.
+    """
+    import signal as _signal
+    data = open(args.file, 'rb').read()
+    if len(data) % FB_LEN:
+        sys.exit(f'apex-oled: {args.file} is not a whole number of '
+                 f'{FB_LEN}-byte frames')
+    frames = [data[i:i + FB_LEN] for i in range(0, len(data), FB_LEN)]
+    if not frames:
+        sys.exit('apex-oled: no frames')
+    period = 1.0 / args.fps
+    total = len(frames) * period
+    print(f'{len(frames)} frames, {args.fps} fps, {total:.1f}s'
+          f'{" (looping)" if args.loop else ""}')
+
+    running = daemon_send({'cmd': 'status'}) is not None
+    if running:
+        daemon_send({'cmd': 'release', 'secs': total + 5 if not args.loop else 1800})
+
+    def give_back(*_):
+        if running:
+            daemon_send({'cmd': 'resume'})
+        sys.exit(0)
+    for sig in (_signal.SIGINT, _signal.SIGTERM):
+        _signal.signal(sig, give_back)
+
+    dpy = Display(args.device)
+    late = 0
+    try:
+        while True:
+            start = time.monotonic()
+            for i, fb in enumerate(frames):
+                dpy.send(fb)
+                # Absolute schedule, not sleep(period): per-frame sleeps
+                # accumulate drift over thousands of frames.
+                target = start + (i + 1) * period
+                delay = target - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    late += 1
+            if not args.loop:
+                break
+            if running:
+                daemon_send({'cmd': 'release', 'secs': 1800})
+        dpy.blank()
+    finally:
+        dpy.close()
+        if running:
+            daemon_send({'cmd': 'resume'})
+    if late:
+        print(f'{late} frame(s) ran late ({late / len(frames) * 100:.1f}%)')
+
+
 def cmd_info(sink, args):
     font, scalable = load_font(13)
     status = daemon_send({'cmd': 'status'})
@@ -476,6 +536,11 @@ def main():
     s.add_argument('--cycle', action='store_true', help='step to the next mode')
 
     add('blank', 'toggle the panel off/on', cmd_blank)
+
+    s = add('play', 'play packed 640-byte frames (see tools/video2fb)', cmd_play)
+    s.add_argument('file')
+    s.add_argument('--fps', type=float, default=30.0)
+    s.add_argument('--loop', action='store_true')
 
     add('info', 'report device and capabilities', cmd_info)
 

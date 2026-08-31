@@ -57,6 +57,7 @@ enabled = true
 # Priority: the highest-numbered active source owns the screen.
 notify = 100
 game = 30
+video = 28
 qwen = 25
 lyrics = 20
 idle = 0

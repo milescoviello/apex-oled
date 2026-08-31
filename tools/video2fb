@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""video2fb - turn any video into packed 1-bit frames for the OLED.
+
+    tools/video2fb input.mp4 out.fb [--fps 30] [--fit height|width|stretch]
+
+Output is a flat stream of 640-byte page-major framebuffers, playable with
+`apex-oled play out.fb`, or by the daemon's `video` source when a matching
+track is playing.
+"""
+import argparse
+import os
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+from PIL import Image
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+apex = SourceFileLoader('apex_oled',
+                        os.path.join(_HERE, os.pardir, 'apex-oled')).load_module()
+W, H = apex.WIDTH, apex.HEIGHT
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('input')
+    p.add_argument('output')
+    p.add_argument('--fps', type=float, default=30.0)
+    p.add_argument('--fit', choices=['height', 'width', 'stretch'], default='height',
+                   help='height: whole frame, pillarboxed (default). '
+                        'width: fill the panel, cropping top/bottom. '
+                        'stretch: distort to fit.')
+    p.add_argument('--threshold', type=int, default=110,
+                   help='grey level that counts as lit (0-255)')
+    p.add_argument('--invert', action='store_true')
+    a = p.parse_args()
+
+    vf = {
+        'height': f'scale=-1:{H}:flags=lanczos,pad={W}:{H}:(ow-iw)/2:0:color=black',
+        'width': f'scale={W}:-1:flags=lanczos,crop={W}:{H}',
+        'stretch': f'scale={W}:{H}:flags=lanczos',
+    }[a.fit]
+    cmd = ['ffmpeg', '-v', 'error', '-i', a.input,
+           '-vf', f'fps={a.fps},{vf},format=gray',
+           '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+
+    size = W * H
+    n = 0
+    with open(a.output, 'wb') as out:
+        while True:
+            buf = proc.stdout.read(size)
+            if len(buf) < size:
+                break
+            img = Image.frombytes('L', (W, H), buf)
+            img = img.point(lambda v: (v <= a.threshold) if a.invert
+                            else (v > a.threshold), mode='1')
+            out.write(apex.pack(img))
+            n += 1
+    proc.wait()
+    if not n:
+        sys.exit('video2fb: no frames produced')
+    print(f'{n} frames ({n / a.fps:.1f}s at {a.fps}fps) -> {a.output} '
+          f'({os.path.getsize(a.output) / 1e6:.1f} MB)')
+
+
+if __name__ == '__main__':
+    main()

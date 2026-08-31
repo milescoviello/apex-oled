@@ -1,0 +1,22 @@
+#!/bin/bash
+# apex-doom - Doom on the keyboard OLED.
+#
+# Takes the panel from apex-oledd for the duration, and grabs the Apex
+# keyboard exclusively so WASD does not type into whatever has focus. The
+# grab is per-fd, so it dies with the process even on a crash - and your
+# laptop's built-in keyboard is a different device and stays usable, which
+# is the escape hatch if this ever wedges.
+set -u
+BIN="$HOME/.local/share/apex-oled/doomgeneric-apex"
+WAD="${APEX_DOOM_WAD:-/usr/share/doom/doom1.wad}"
+[ -r "$WAD" ] || { echo "no WAD at $WAD (set APEX_DOOM_WAD)"; exit 1; }
+
+ipc() { python3 -c "
+from importlib.machinery import SourceFileLoader
+a=SourceFileLoader('a','$HOME/.local/bin/apex-oled').load_module()
+a.daemon_send({'cmd':'$1','secs':3600})" 2>/dev/null; }
+
+ipc release
+trap 'ipc resume' EXIT INT TERM
+cd "$(dirname "$BIN")"
+"$BIN" -iwad "$WAD" "$@"
