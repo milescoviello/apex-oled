@@ -880,7 +880,14 @@ class QwenSource(Source):
             return True                     # prefilling or generating right now
         pf = st.get('prefill')
         if pf and not pf.get('complete'):
-            return True                     # a prefill is genuinely in progress
+            # Only trust an incomplete prefill when the server agrees something
+            # is running. qwen-status leaves the last prefill behind when a
+            # request is interrupted - it sat at "72% complete, eta 63s" with
+            # the server idle - and believing it pinned this source active
+            # forever, locking every other view off the panel.
+            if self._ctx_used is None:
+                return True                 # no /slots to cross-check against
+            return False
         return (now - self._gen_seen) < self.GEN_FRESH
 
     def render(self, now):
@@ -1583,7 +1590,8 @@ class Server(threading.Thread):
             return {'ok': True, 'source': self.ctx.current_source,
                     'sources': [s.name for s in self.ctx.sources if s.active(now)],
                     'blanked': self.ctx.blanked,
-                    'device_error': self.ctx.device_error}
+                    'device_error': self.ctx.device_error,
+                    'forced_mode': self.ctx.forced_mode}
         return {'ok': False, 'error': f'unknown command: {cmd!r}'}
 
 

@@ -485,6 +485,31 @@ def t_qwen_live_rate():
         urllib.request.urlopen = real_open
 
 
+@check('a stale prefill does not pin QwenSource active forever')
+def t_qwen_stale_prefill():
+    import time
+    now = time.time()
+    # qwen-status leaves the last prefill behind when a request is interrupted:
+    # "72% done, eta 63s" while the server is idle. Believing it locked every
+    # other view off the panel indefinitely.
+    stale = {'model_up': True, 'ctx_size': 262144, 'gen_tok_s': 51.9,
+             'gpu': {}, 'prefill': {'complete': False, 'fraction': 0.72,
+                                    'tokens_done': 124373, 'eta_s': 62.9}}
+    src = _qwen(stale)
+    src._processing = False
+    src._ctx_used = (123760, 262144)     # /slots says nothing is running
+    eq(src.active(now), False, 'stale prefill with an idle server')
+
+    # the same state while the server really is working stays active
+    src._processing = True
+    eq(src.active(now), True, 'prefill with the server actually processing')
+
+    # and with no /slots to cross-check, trust the status file
+    src._processing = False
+    src._ctx_used = None
+    eq(src.active(now), True, 'no /slots available, fall back to trusting it')
+
+
 @check('QwenSource survives nulls and junk without crashing')
 def t_qwen_null_safe():
     import time

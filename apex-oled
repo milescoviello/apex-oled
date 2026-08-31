@@ -469,6 +469,10 @@ def cmd_info(sink, args):
     elif status:
         print(f'daemon      : running, showing {status.get("source")!r}'
               f'{" (blanked)" if status.get("blanked") else ""}')
+        if status.get('forced_mode'):
+            print(f'              PINNED to {status["forced_mode"]!r} - nothing '
+                  f'else can take the screen')
+            print("              release with: apex-oled mode auto")
         print(f'              active sources: {", ".join(status.get("sources", []))}')
         print('              CLI frames route through it; --direct to bypass')
     else:
