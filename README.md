@@ -62,7 +62,7 @@ without it everything falls back to a 6×11 bitmap font and font sizes are
 ignored. On Gentoo that's `USE=truetype` on `dev-python/pillow`.
 
 ```bash
-git clone https://github.com/kitslayer/apex-oled ~/apex-oled
+git clone https://github.com/milescoviello/apex-oled ~/apex-oled
 ~/apex-oled/install.sh
 ```
 
@@ -144,7 +144,7 @@ Then give it a priority in `[sources]`.
 
 The `lyrics` source reads a small JSON state file (default
 `~/.cache/nowplaying/state.json`) written by a separate now-playing daemon —
-mine is [nowplaying](https://github.com/kitslayer/nowplaying), which
+mine is [nowplaying](https://github.com/milescoviello/nowplaying), which
 fingerprints audio and pulls synced lyrics from LRCLIB.
 It only needs a handful of keys — `title`, `artist`, `playing`, `duration`,
 `cover_file`, `lyrics_synced`, a `[[timestamp, text], ...]` lyrics list, and
