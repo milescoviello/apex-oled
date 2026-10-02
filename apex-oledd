@@ -101,6 +101,9 @@ DEFAULTS = {
     },
     'game': {
         'enabled': True,
+        # MangoHud log folder to read live FPS from; must match output_folder
+        # in MangoHud.conf. Empty = $XDG_RUNTIME_DIR/mangohud.
+        'mangohud_logs': '',
     },
     'video': {
         # Play a packed frame file in sync when a matching track is playing.
@@ -113,7 +116,8 @@ DEFAULTS = {
     },
     'qwen': {
         # Local llama.cpp inference stats. Only claims the screen during a
-        # prefill, just after a generation, or when the server is down.
+        # prefill, just after a generation, or when the model server has died
+        # under a running proxy (both down = stack off, which stays quiet).
         'enabled': True,
         'command': 'qwen-status',
         # Real context occupancy. prefill.tokens_done is only the incremental
@@ -676,28 +680,133 @@ class NotifySource(Source):
             return self._frame
 
 
+def mangohud_log_dir(cfg):
+    d = cfg['game'].get('mangohud_logs')
+    if d:
+        return os.path.expanduser(d)
+    run = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+    return os.path.join(run, 'mangohud')
+
+
+class MangoHudFps:
+    """Live frame rate, read from the tail of MangoHud's CSV log.
+
+    A game's frame rate is invisible from outside the process; MangoHud is the
+    layer already sitting in the present path. With autostart_log it appends a
+    row per log_interval and flushes each one, so the newest file's last line
+    is the current FPS. A log that has stopped growing is a game that closed.
+    """
+    STALE = 3.0             # not written for this long: the game has exited
+    RESCAN = 2.0            # how often to look for a newer log file
+    PRUNE_AGE = 2 * 86400   # old session logs; the folder is tmpfs anyway
+
+    def __init__(self, cfg):
+        self.dir = mangohud_log_dir(cfg)
+        self._log = None
+        self._scanned = 0.0
+        try:
+            # MangoHud does not create output_folder; a missing one just
+            # means no log, silently.
+            os.makedirs(self.dir, exist_ok=True)
+        except OSError:
+            pass
+
+    def _scan(self, now):
+        newest, best = None, 0.0
+        try:
+            entries = list(os.scandir(self.dir))
+        except OSError:
+            return None
+        for e in entries:
+            if not e.name.endswith('.csv'):
+                continue
+            try:
+                m = e.stat().st_mtime
+            except OSError:
+                continue
+            if now - m > self.PRUNE_AGE:
+                try:
+                    os.unlink(e.path)
+                except OSError:
+                    pass
+            elif not e.name.endswith('_summary.csv') and m > best:
+                newest, best = e.path, m
+        return newest
+
+    def read(self, now):
+        if now - self._scanned >= self.RESCAN:
+            self._scanned = now
+            self._log = self._scan(now)
+        if not self._log:
+            return None
+        try:
+            st = os.stat(self._log)
+            if now - st.st_mtime > self.STALE:
+                return None
+            with open(self._log, 'rb') as f:
+                f.seek(max(0, st.st_size - 512))
+                tail = f.read().decode('ascii', 'replace')
+        except OSError:
+            return None
+        # The last element is whatever follows the final newline: empty, or a
+        # row caught half-written. The one before it is the newest whole row.
+        rows = tail.split('\n')
+        if len(rows) < 2:
+            return None
+        try:
+            fps = float(rows[-2].split(',', 1)[0])
+        except ValueError:
+            return None             # still on the header lines
+        return fps if fps >= 0 else None
+
+
 class GameSource(Source):
-    """Thermals and swap thrash while gamemode is active.
+    """Frame rate, thermals and swap thrash while a game is running.
 
     Fullscreen games hide every other readout, so this puts the numbers that
-    explain a stutter - GPU load, and whether the machine is paging - on a
-    surface that is still visible.
+    explain a stutter - FPS, GPU load, and whether the machine is paging - on a
+    surface that is still visible. A game counts as running while gamemode is
+    active or while MangoHud is writing a log.
     """
     name = 'game'
     fps = 2.0
 
     SWAP_ON = 0.05          # MiB/s that counts as "we are paging"
     SWAP_HOLD = 10.0        # keep the swap row this long after the last burst
+    FPS_COL = 40            # width of the big-number column
+    FPS_SIZES = (26, 22, 18, 15)
 
     def __init__(self, ctx):
         super().__init__(ctx)
         self._swap_until = 0.0
         self._swap_peak = 0.0
+        self._mango = MangoHudFps(ctx.cfg)
 
     def active(self, now):
-        return self.ctx.cfg['game'].get('enabled', True) and self.ctx.s.gamemode()
+        if not self.ctx.cfg['game'].get('enabled', True):
+            return False
+        return self.ctx.s.gamemode() or self._mango.read(now) is not None
+
+    def _swapping(self, now):
+        """Latched peak swap rate (MiB/s), or None when not paging.
+
+        Latched, not instantaneous: paging is bursty, and testing the rate
+        directly flipped the row against the RAM bar twice a second. Peak
+        rather than the live sample, which is unreadable redrawn at 2 Hz.
+        """
+        rate = self.ctx.s.swap_rate()
+        if rate and (rate[0] > self.SWAP_ON or rate[1] > self.SWAP_ON):
+            self._swap_until = now + self.SWAP_HOLD
+            self._swap_peak = max(self._swap_peak, rate[0], rate[1])
+        if now >= self._swap_until:
+            self._swap_peak = 0.0
+            return None
+        return self._swap_peak
 
     def render(self, now):
+        fps = self._mango.read(now)
+        if fps is not None:
+            return self._render_fps(now, fps)
         s, f = self.ctx.s, self.ctx.fonts
         ui = f.get(self.ctx.cfg['fonts']['ui_size'])
         img = Image.new('1', (WIDTH, HEIGHT), 0)
@@ -716,25 +825,57 @@ class GameSource(Source):
 
         # The payoff line: sustained swap traffic is the stutter you cannot
         # otherwise see, so it takes the row whenever it is happening.
-        # Latched, not instantaneous: paging is bursty, and testing the rate
-        # directly flipped this row against the RAM bar twice a second.
-        rate = s.swap_rate()
-        if rate and (rate[0] > self.SWAP_ON or rate[1] > self.SWAP_ON):
-            self._swap_until = now + self.SWAP_HOLD
-            self._swap_peak = max(self._swap_peak, rate[0], rate[1])
-        if now >= self._swap_until:
-            self._swap_peak = 0.0
-        if now < self._swap_until:
-            rate = rate or (0.0, 0.0)
+        peak = self._swapping(now)
+        if peak is not None:
             draw_text(img, (3, r2), 'SWAP', ui)
-            # Peak rather than instantaneous: the number is unreadable if it
-            # redraws from a fresh sample twice a second.
-            draw_right(img, 125, r2, f'peak {self._swap_peak:.0f} MB/s', ui)
+            draw_right(img, 125, r2, f'peak {peak:.0f} MB/s', ui)
         else:
             mem = s.mem()
             if mem:
                 draw_text(img, (3, r2), 'RAM', ui)
                 draw_bar(img, (34, r2 + 2, 125, r2 + 8), mem[0] / mem[1])
+        return img
+
+    def _render_fps(self, now, fps):
+        """Big FPS on the left; the three stat rows squeezed to the right."""
+        s, f = self.ctx.s, self.ctx.fonts
+        ui = f.get(self.ctx.cfg['fonts']['ui_size'])
+        img = Image.new('1', (WIDTH, HEIGHT), 0)
+        r0, r1, r2 = row_steps(ui, 3)
+        col = self.FPS_COL
+
+        num = f'{fps:.0f}'
+        big = next((f.get(sz) for sz in self.FPS_SIZES
+                    if text_width(num, f.get(sz)) <= col - 2),
+                   f.get(self.FPS_SIZES[-1]))
+        # Place by the glyphs' ink, not the font's line box: digits have no
+        # descenders, so line_height() would leave the number floating high.
+        x0, y0, x1, y1 = big.getbbox(num)
+        draw_text(img, ((col - (x1 - x0)) // 2 - x0, r1 + line_height(ui) - y1),
+                  num, big)
+        draw_centered(img, r2, 'fps', ui, 0, col)
+
+        x = col + 4
+        gpu = s.gpu()
+        draw_text(img, (x, r0), 'GPU', ui)
+        draw_right(img, 100, r0, f"{gpu['util']}%" if gpu else '--', ui)
+        draw_right(img, 125, r0, f"{gpu['temp']}c" if gpu else '--', ui)
+
+        draw_text(img, (x, r1), 'CPU', ui)
+        u = s.cpu_util()
+        draw_right(img, 100, r1, f'{u:.0f}%' if u is not None else '--', ui)
+        t = s.cpu_temp()
+        draw_right(img, 125, r1, f'{t}c' if t is not None else '--', ui)
+
+        peak = self._swapping(now)
+        if peak is not None:
+            draw_text(img, (x, r2), 'SWAP', ui)
+            draw_right(img, 125, r2, f'{peak:.0f}M/s', ui)
+        else:
+            mem = s.mem()
+            if mem:
+                draw_text(img, (x, r2), 'RAM', ui)
+                draw_bar(img, (x + 26, r2 + 2, 125, r2 + 8), mem[0] / mem[1])
         return img
 
 
@@ -776,6 +917,10 @@ class QwenSource(Source):
     GEN_FRESH = 10.0        # treat a finished generation as news for this long
     BUSY_POLL = 1.0
     IDLE_POLL = 5.0
+    # Stack switched off: nothing to show, and qwen-status shells out to
+    # nvidia-smi on every call, so check back only occasionally. A prefill
+    # takes minutes, so noticing the stack 30s late costs nothing.
+    OFF_POLL = 30.0
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -858,14 +1003,28 @@ class QwenSource(Source):
         self._prev_complete = complete
         self._status = st
 
+    @staticmethod
+    def _broken(st):
+        """The stack is running but its model server is not.
+
+        The proxy only exists to front llama-server, so "proxy up, model down"
+        means something died. Both down is just the stack switched off - the
+        normal state at boot - and is not worth a screen.
+        """
+        return bool(st.get('proxy_up')) and not st.get('model_up')
+
     def _loop(self):
         while not self.ctx.stop.is_set():
             self._poll_once()
             st = self._status or {}
             pf = st.get('prefill') or {}
-            busy = ((not st.get('model_up', True)) or self._processing
-                    or (pf and not pf.get('complete')))
-            if self.ctx.stop.wait(self.BUSY_POLL if busy else self.IDLE_POLL):
+            if self._broken(st) or self._processing or (pf and not pf.get('complete')):
+                wait = self.BUSY_POLL
+            elif not st.get('model_up') and not st.get('proxy_up'):
+                wait = self.OFF_POLL
+            else:
+                wait = self.IDLE_POLL
+            if self.ctx.stop.wait(wait):
                 break
 
     def active(self, now):
@@ -874,8 +1033,10 @@ class QwenSource(Source):
         st = self._status
         if not st:
             return False
-        if not st.get('model_up'):
+        if self._broken(st):
             return True                     # a dead server is worth interrupting for
+        if not st.get('model_up'):
+            return False                    # stack off: nothing to report
         if self._processing:
             return True                     # prefilling or generating right now
         pf = st.get('prefill')
@@ -900,7 +1061,7 @@ class QwenSource(Source):
         img = Image.new('1', (WIDTH, HEIGHT), 0)
         r0, r1, r2 = row_steps(ui, 3)
 
-        if not st.get('model_up'):
+        if self._broken(st):
             # Inverted so a dead server is unmistakable at a glance rather
             # than being one more line of small text. Draw white-on-black as
             # usual and flip the finished frame - drawing onto a white canvas
@@ -908,6 +1069,11 @@ class QwenSource(Source):
             draw_centered(img, 4, 'QWEN', ui)
             draw_centered(img, 4 + line_height(ui), 'MODEL DOWN', big)
             return ImageOps.invert(img.convert('L')).convert('1')
+        if not st.get('model_up'):
+            # Only reachable when pinned: switched off is not an alarm.
+            draw_centered(img, 4, 'QWEN', ui)
+            draw_centered(img, 4 + line_height(ui), 'stack off', big)
+            return img
 
         pf = st.get('prefill') or {}
         gpu = st.get('gpu') or {}

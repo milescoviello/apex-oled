@@ -50,7 +50,10 @@ pause_hold = 15.0
 gap_seconds = 8.0
 
 [game]
-# The game HUD activates while gamemode is running (gamemoded -s).
+# The game HUD activates while gamemode is running (gamemoded -s), or
+# while MangoHud is writing a log - which is also where its FPS comes from.
+# Must match output_folder in MangoHud.conf; empty = $XDG_RUNTIME_DIR/mangohud.
+mangohud_logs = ""
 enabled = true
 
 [sources]
@@ -64,7 +67,8 @@ idle = 0
 
 [qwen]
 # Local llama.cpp inference stats. Only claims the screen during a prefill,
-# just after one completes, or when the server is down.
+# just after one completes, or when the model server has died under a
+# running proxy. Both down means the stack is off, which stays quiet.
 enabled = true
 command = "qwen-status"
 # Real context occupancy. prefill.tokens_done is only the *incremental*

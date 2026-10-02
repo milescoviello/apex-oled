@@ -390,7 +390,13 @@ def t_qwen_gating():
         ('idle, generation long ago', {**base}, 0.0, False),
         ('prefill in progress',
          {**base, 'prefill': {**base['prefill'], 'complete': False}}, 0.0, True),
-        ('model down', {**base, 'model_up': False}, 0.0, True),
+        ('model died under a running proxy', {**base, 'model_up': False}, 0.0, True),
+        # Both down is the stack switched off - the state at every boot. It
+        # used to claim the screen as MODEL DOWN until the model was started.
+        ('stack off', {**base, 'model_up': False, 'proxy_up': False}, 0.0, False),
+        ('stack off, old prefill left behind',
+         {**base, 'model_up': False, 'proxy_up': False,
+          'prefill': {**base['prefill'], 'complete': False}}, 0.0, False),
         ('generation just finished', {**base}, now, True),
         ('no prefill yet', {**base, 'prefill': None}, 0.0, False),
         ('status unavailable', None, 0.0, False),
@@ -651,6 +657,92 @@ def t_compose_bounds():
     for t in range(0, 1200, 7):
         out = oledd.compose(src, float(t), cfg)
         eq(out.size, (W, H), 'composed size')
+
+
+_MANGO_HEAD = ('os,cpu,gpu,ram,kernel,driver,cpuscheduler\n'
+               'Gentoo,Ultra 9,RTX 5090,32GB,7.2.8,595,\n'
+               'fps,frametime,cpu_load,cpu_power,gpu_load,cpu_temp,gpu_temp,'
+               'gpu_core_clock,gpu_mem_clock,gpu_vram_used,gpu_power,ram_used,'
+               'swap_used,process_rss,elapsed\n')
+
+
+def _mango_row(fps):
+    return f'{fps},6.9,40,80,98,81,66,2400,12000,9.1,140,18.2,0.1,4.2,1234\n'
+
+
+@check('MangoHudFps reads the newest whole row and ignores the rest')
+def t_mango_fps():
+    import time
+    d = tempfile.mkdtemp()
+    cfg = oledd.load_config('/nonexistent')
+    cfg['game']['mangohud_logs'] = d
+    m = oledd.MangoHudFps(cfg)
+    now = time.time()
+    eq(m.read(now), None, 'empty folder')
+
+    log = os.path.join(d, 'Game.exe_2026-10-02_15-00-00.csv')
+    with open(log, 'w') as f:
+        f.write(_MANGO_HEAD)
+    m._scanned = 0
+    eq(m.read(time.time()), None, 'header only, no samples yet')
+
+    with open(log, 'a') as f:
+        f.write(_mango_row(143.6) + _mango_row(87.2) + '61.0,16.')  # half-written
+    m._scanned = 0
+    eq(m.read(time.time()), 87.2, 'last whole row, not the partial one')
+
+    # The end-of-run summary sits beside the log and must not be mistaken for it.
+    summary = log.replace('.csv', '_summary.csv')
+    with open(summary, 'w') as f:
+        f.write('0.1% Min FPS,1% Min FPS,97% Percentile FPS,Average FPS\n1,2,3,4\n')
+    m._scanned = 0
+    eq(m.read(time.time()), 87.2, 'summary file ignored')
+
+    old = time.time() - 10
+    os.utime(log, (old, old))
+    m._scanned = 0
+    eq(m.read(time.time()), None, 'log stopped growing = game closed')
+
+    ancient = time.time() - 3 * 86400
+    os.utime(log, (ancient, ancient))
+    m._scanned = 0
+    m.read(time.time())
+    eq(os.path.exists(log), False, 'old session logs pruned')
+
+
+@check('GameSource claims the screen on a live MangoHud log, without gamemode')
+def t_game_fps_source():
+    import time
+
+    class _S:
+        def gamemode(self): return False
+        def gpu(self): return {'util': 100, 'temp': 87}
+        def cpu_util(self): return 13.0
+        def cpu_temp(self): return 104
+        def swap_rate(self): return (0.0, 0.0)
+        def mem(self): return (9.0, 31.0)
+
+    d = tempfile.mkdtemp()
+    ctx = _Ctx()
+    ctx.s = _S()
+    ctx.cfg['game']['mangohud_logs'] = d
+    src = oledd.GameSource(ctx)
+    eq(src.active(time.time()), False, 'no game, no gamemode')
+
+    log = os.path.join(d, 'Game.exe_2026-10-02_15-00-00.csv')
+    for fps in (7, 144, 1240, 9999):
+        with open(log, 'w') as f:
+            f.write(_MANGO_HEAD + _mango_row(fps))
+        src._mango._scanned = 0
+        now = time.time()
+        eq(src.active(now), True, f'{fps} fps: active')
+        img = src.render(now)
+        eq(img.size, (W, H), f'{fps} fps: frame size')
+        # The number must stay inside its column and clear of the burn-in
+        # margin, however many digits it has.
+        box = img.crop((0, 0, src.FPS_COL, H)).getbbox()
+        if box and (box[0] < 1 or box[2] > src.FPS_COL):
+            raise AssertionError(f'{fps} fps: digits spill out of the column {box}')
 
 
 def main():

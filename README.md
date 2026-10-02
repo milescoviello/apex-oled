@@ -101,11 +101,31 @@ producers don't race to be the last writer:
 | source | priority | shows |
 |---|---|---|
 | `notify` | 100 | transient frames pushed by the CLI over a unix socket |
-| `game` | 30 | GPU/CPU load and temps, plus **swap in/out**, while gamemode runs |
+| `game` | 30 | live **FPS** (via MangoHud), GPU/CPU load and temps, **swap in/out**, while gamemode runs or MangoHud is logging |
 | `video` | 28 | packed frames synced to a matching now-playing track |
 | `qwen` | 25 | local llama.cpp prefill progress, live decode rate, context bar |
 | `lyrics` | 20 | current synced lyric, else a now-playing card |
 | `idle` | 0 | RAM/VRAM capacity bars over CPU and GPU rows |
+
+### FPS in the game view
+
+A game's frame rate is invisible from outside the process, so it comes from
+MangoHud's CSV log: with auto-logging on, MangoHud appends a row per interval
+and flushes it, and the daemon reads the newest row. Add to
+`~/.config/MangoHud/MangoHud.conf` (the folder must match `[game]
+mangohud_logs`; MangoHud expands only `~`, not `$XDG_RUNTIME_DIR`, so give the
+absolute path):
+
+```ini
+output_folder=/run/user/1000/mangohud
+autostart_log=1
+log_interval=500
+```
+
+`/run/user` is tmpfs, so nothing touches the disk; the daemon creates the
+folder and prunes logs older than two days. While logging, MangoHud draws a
+small dot in its overlay's corner. Games without MangoHud keep the no-FPS
+layout.
 
 While the daemon runs, CLI writes route through it as expiring top-priority
 frames (`--notify SECS`, default 5). `--direct` bypasses it.
