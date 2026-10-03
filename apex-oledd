@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import tomllib
+import unicodedata
 from importlib.machinery import SourceFileLoader
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, features
@@ -80,6 +81,10 @@ DEFAULTS = {
         'ui_size': 10,
         'lyric_size': 12,
         'small_size': 9,
+        # Faces tried, in order, for characters the main font lacks (CJK,
+        # Thai, Devanagari, emoji...); anything still missing goes to
+        # fontconfig's ranking. The first CJK face sets the Han glyph shapes.
+        'fallback': ['Noto Sans CJK JP', 'Noto Emoji'],
     },
     'idle': {
         'bars': ['ram', 'vram'],
@@ -179,6 +184,7 @@ class Fonts:
              if os.path.exists(os.path.join(d, name))), None)
         if self.path is None:
             self.scalable = False       # fall back to the bundled bitmap font
+        self.fallback = list(cfg['fonts'].get('fallback', apex.FALLBACK_FAMILIES))
         self._cache = {}
 
     def get(self, size):
@@ -186,18 +192,15 @@ class Fonts:
             font = None
             if self.scalable:
                 try:
-                    font = ImageFont.truetype(self.path, size)
+                    font = apex.FontChain(self.path, size, self.fallback)
                 except OSError:
                     font = None
             self._cache[size] = font or ImageFont.load_default()
         return self._cache[size]
 
 
-_probe = ImageDraw.Draw(Image.new('1', (1, 1)))
-
-
 def text_width(s, font):
-    return int(_probe.textlength(s, font=font))
+    return int(apex.text_length(s, font))
 
 
 def line_height(font):
@@ -209,7 +212,7 @@ def line_height(font):
 
 
 def draw_text(img, xy, s, font, fill=1):
-    ImageDraw.Draw(img).text(xy, s, font=font, fill=fill)
+    apex.draw_string(ImageDraw.Draw(img), xy, s, font, fill)
 
 
 def draw_centered(img, y, s, font, x0=0, x1=WIDTH):
@@ -221,40 +224,101 @@ def draw_right(img, x_right, y, s, font):
     draw_text(img, (x_right - text_width(s, font), y), s, font)
 
 
+# Japanese line-breaking rules (kinsoku): these never start a line...
+_NO_BREAK_BEFORE = set(
+    '、。，．,.・：；？！?!)）]］｝〕〉》」』】〙〗〟’”ゝゞ々〻ー゠〜～…‥'
+    'ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ')
+# ...and these never end one.
+_NO_BREAK_AFTER = set('([（［｛〔〈《「『【〘〖〝‘“')
+
+
+def _unspaced(ch):
+    """Scripts written without spaces, so a line may break between letters:
+    Chinese, Japanese and other full-width text, Thai, Lao, Myanmar, Khmer.
+    Not Hangul - Korean puts spaces between words, and splitting one
+    ("당 / 신의") reads as badly as splitting an English word."""
+    cp = ord(ch)
+    if (0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF
+            or 0x3130 <= cp <= 0x318F):
+        return False
+    return (unicodedata.east_asian_width(ch) in ('W', 'F')
+            or 0x0E00 <= cp <= 0x0EFF or 0x1000 <= cp <= 0x109F
+            or 0x1780 <= cp <= 0x17FF)
+
+
+def break_units(s):
+    """Split into the pieces a line may break between, as (text, joiner).
+
+    Spaces separate words as before; scripts without spaces may also break
+    between characters (whole clusters, so a vowel sign never strands).
+    Thai and friends really break at word boundaries, which needs a
+    dictionary - between clusters is the readable approximation.
+    """
+    units = []
+    for word in s.split():
+        joiner = ' ' if units else ''
+        piece, prev = '', None
+        for c in apex.clusters(word):
+            if (prev is not None and (_unspaced(prev[0]) or _unspaced(c[0]))
+                    and c[0] not in _NO_BREAK_BEFORE
+                    and prev[-1] not in _NO_BREAK_AFTER):
+                units.append((piece, joiner))
+                piece, joiner = '', ''
+            piece += c
+            prev = c
+        units.append((piece, joiner))
+    return units
+
+
 def wrap(s, avail, font, lines=2):
-    """Balanced word wrap into at most `lines` rows, or None if it won't fit.
+    """Balanced wrap into at most `lines` rows, or None if it won't fit.
 
     Balanced rather than greedy: greedy packs the first row full and leaves a
     stray word below ("Blow by blow and go" / "away"), which looks broken on a
     panel this small. This picks the split with the evenest rows.
+
+    Candidate rows are scored from summed piece widths, which is fast enough
+    for a Japanese line's dozens of break points; the winner is then checked
+    against its real rendered width.
     """
     if text_width(s, font) <= avail:
         return [s]
-    words = s.split()
-    if len(words) < lines:
+    units = break_units(s)
+    if len(units) < lines:
         return None
-    best = None
-    for cuts in itertools.combinations(range(1, len(words)), lines - 1):
-        parts, prev = [], 0
-        for c in cuts + (len(words),):
-            parts.append(' '.join(words[prev:c]))
-            prev = c
-        widths = [text_width(p, font) for p in parts]
-        if max(widths) > avail:
-            continue
-        score = max(widths) - min(widths)
-        if best is None or score < best[0]:
-            best = (score, parts)
-    return best[1] if best else None
+    widths = [text_width(u, font) for u, _ in units]
+    space = text_width(' ', font)
+    cum = [0]
+    for (u, j), w in zip(units, widths):
+        cum.append(cum[-1] + w + (space if j else 0))
+
+    def est(a, b):          # width of units[a:b] as one row
+        return cum[b] - cum[a] - (space if units[a][1] else 0)
+
+    def text(a, b):
+        return units[a][0] + ''.join(j + u for u, j in units[a + 1:b])
+
+    candidates = []
+    for cuts in itertools.combinations(range(1, len(units)), lines - 1):
+        bounds = (0,) + cuts + (len(units),)
+        ws = [est(a, b) for a, b in zip(bounds, bounds[1:])]
+        if max(ws) <= avail:
+            candidates.append((max(ws) - min(ws), bounds))
+    for _, bounds in sorted(candidates):
+        rows = [text(a, b) for a, b in zip(bounds, bounds[1:])]
+        if all(text_width(r, font) <= avail for r in rows):
+            return rows
+    return None
 
 
 def fit(s, avail, font):
     """Truncate to `avail`, marking the cut with an ellipsis."""
     if text_width(s, font) <= avail:
         return s
-    while s and text_width(s + '..', font) > avail:
-        s = s[:-1]
-    return s.rstrip() + '..'
+    cl = apex.clusters(s)               # never cut a base from its marks
+    while cl and text_width(''.join(cl) + '..', font) > avail:
+        cl.pop()
+    return ''.join(cl).rstrip() + '..'
 
 
 def row_steps(font, count=3, height=HEIGHT):
@@ -268,12 +332,28 @@ def row_steps(font, count=3, height=HEIGHT):
     return [i * step for i in range(count)]
 
 
+_layouts = {}
+
+
 def layout_text(s, avail_w, avail_h, fonts, sizes, max_lines=3):
     """Largest font and fewest rows that fit `s` into the given box.
 
     Returns (rows, font, line_height) or None. Trying sizes largest-first
     means short lyrics get big type and only long ones shrink.
+
+    Memoised: the lyric view redraws 15 times a second with the same line,
+    and searching break points is not free for text without spaces.
     """
+    key = (s, avail_w, avail_h, tuple(sizes), max_lines, id(fonts))
+    if key not in _layouts:
+        if len(_layouts) > 256:
+            _layouts.clear()
+        _layouts[key] = _layout_text(s, avail_w, avail_h, fonts, sizes,
+                                     max_lines)
+    return _layouts[key]
+
+
+def _layout_text(s, avail_w, avail_h, fonts, sizes, max_lines):
     for size in sizes:
         font = fonts.get(size)
         lh = line_height(font)

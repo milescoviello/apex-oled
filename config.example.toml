@@ -24,6 +24,12 @@ family = "condensed"
 ui_size = 10
 lyric_size = 12
 small_size = 9
+# Faces tried, in order, for characters the main font lacks (Japanese,
+# Chinese, Korean, Thai, Devanagari, emoji...); anything still missing
+# falls through to fontconfig's ranking of every installed font. The first
+# CJK face decides how shared Han characters look - JP draws them the
+# Japanese way. Colour emoji fonts are skipped: they cannot scale to 1-bit.
+fallback = ["Noto Sans CJK JP", "Noto Emoji"]
 
 [idle]
 # Two capacity bars across the top. Choose from: ram, vram, swap, disk

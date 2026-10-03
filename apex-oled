@@ -27,15 +27,18 @@ expects a leading report-number byte, which is 0 because this descriptor
 declares no report IDs; the kernel strips it before the transfer.
 """
 import argparse
+import bisect
 import fcntl
 import glob
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
+import unicodedata
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 SOCKET_PATH = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'),
                            'apex-oledd.sock')
@@ -140,8 +143,323 @@ def pack_reference(img):
     return bytes(fb)
 
 
+# ---------------------------------------------------------------------------
+# text in any script
+# ---------------------------------------------------------------------------
+#
+# DejaVu has no CJK, Thai, Devanagari or emoji, and Pillow does no font
+# fallback of its own: a character the font lacks draws as an empty box. So a
+# FontChain picks a face per character - the primary, then the preferred
+# fallbacks, then whatever fontconfig ranks next - and draws the runs on the
+# primary's baseline.
+
+# Order matters for Han characters, which Japanese, Chinese and Korean share
+# but draw differently: the first CJK face listed decides their shapes.
+FALLBACK_FAMILIES = ['Noto Sans CJK JP', 'Noto Emoji']
+
+# With libraqm, Pillow shapes text (Arabic joining, Indic vowel reordering)
+# and runs the bidi algorithm. Without it, glyphs are placed one by one, and
+# right-to-left runs are reversed here instead - readable for Hebrew, but
+# Arabic letters stay unjoined.
+RAQM = features.check('raqm')
+
+_FC_FMT = '%{file}\t%{index}\t%{scalable}\t%{color}\t%{charset}\n'
+
+
+def _parse_charset(spec):
+    """fontconfig's '%{charset}' ('20-7e a0-17f 3000') -> sorted ranges."""
+    ranges = []
+    for tok in spec.split():
+        lo, _, hi = tok.partition('-')
+        ranges.append((int(lo, 16), int(hi or lo, 16)))
+    return ranges
+
+
+class _Face:
+    """One font file (and face index), what it covers, and its sizes."""
+
+    def __init__(self, path, index=0, charset=None):
+        self.path, self.index = path, index
+        self._charset = charset     # parsed on first use: thousands are listed
+        self._lo = self._hi = None
+        self._sizes = {}
+
+    def has(self, cp):
+        if self._lo is None:
+            ranges = (_parse_charset(self._charset) if self._charset is not None
+                      else [(0, 0x10FFFF)])
+            self._lo = [r[0] for r in ranges]
+            self._hi = [r[1] for r in ranges]
+        i = bisect.bisect_right(self._lo, cp) - 1
+        return i >= 0 and cp <= self._hi[i]
+
+    def at(self, size):
+        font = self._sizes.get(size)
+        if font is None:
+            font = self._sizes[size] = ImageFont.truetype(
+                self.path, size, index=self.index)
+        return font
+
+
+def _fc_faces(argv):
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    faces = []
+    for line in out.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 5:
+            continue
+        path, index, scalable, color, charset = parts
+        # Bitmap-only faces and colour emoji come in fixed strikes (Noto Color
+        # Emoji is 109px only) that Pillow will not scale to a 10px line.
+        if scalable == 'False' or color == 'True':
+            continue
+        try:
+            faces.append(_Face(path, int(index), charset))
+        except ValueError:
+            continue
+    return faces
+
+
+class _Faces:
+    """Every face a chain may use, shared across sizes; one per primary."""
+    _registry = {}
+
+    @classmethod
+    def get(cls, primary, fallbacks):
+        key = (primary, tuple(fallbacks))
+        if key not in cls._registry:
+            cls._registry[key] = cls(primary, fallbacks)
+        return cls._registry[key]
+
+    def __init__(self, primary, fallbacks):
+        found = _fc_faces(['fc-query', '--index', '0', '--format', _FC_FMT,
+                           primary])
+        # No fontconfig: trust the primary for everything, as before.
+        self.primary = found[0] if found else _Face(primary)
+        self.chain = [self.primary]
+        seen = {(self.primary.path, self.primary.index)}
+        for family in fallbacks:
+            for face in _fc_faces(['fc-match', '--format', _FC_FMT, family]):
+                if (face.path, face.index) not in seen:
+                    seen.add((face.path, face.index))
+                    self.chain.append(face)
+        self._seen = seen
+        self._rest = None       # fontconfig's full ranking, fetched on demand
+        self._cache = {}
+
+    def face_of(self, cp):
+        face = self._cache.get(cp)
+        if face is None:
+            face = self._cache[cp] = self._find(cp)
+        return face
+
+    def _find(self, cp):
+        for face in self.chain:
+            if face.has(cp):
+                return face
+        if self._rest is None:
+            # Lazy: only text outside the primary and preferred faces pays
+            # for listing every installed font.
+            # -a, not -s: -s trims every font that adds no new coverage, which
+            # drops Noto Sans Thai because FreeSerif already covered Thai.
+            rest = [f for f in _fc_faces(['fc-match', '-a', '--format',
+                                          _FC_FMT, 'sans-serif'])
+                    if (f.path, f.index) not in self._seen]
+            # fontconfig ranks catch-all fonts (FreeSans, FreeSerif) ahead of
+            # the per-script Noto Sans faces, which drew Thai in a serif. The
+            # sort is stable, so fontconfig's order holds within each group.
+            self._rest = sorted(rest, key=lambda f: not _noto_sans(f.path))
+        for face in self._rest:
+            if face.has(cp):
+                return face
+        return self.primary     # nothing has it: an honest box
+
+
+def _noto_sans(path):
+    name = os.path.basename(path)
+    return name.startswith('NotoSans') and 'Mono' not in name
+
+
+def _is_mark(ch):
+    """Joins the previous character: accents, vowel signs, emoji modifiers."""
+    cp = ord(ch)
+    return (unicodedata.category(ch) in ('Mn', 'Mc', 'Me')
+            or cp in (0x200C, 0x200D)                   # ZWNJ, ZWJ
+            or 0x1F3FB <= cp <= 0x1F3FF                 # skin tones
+            or 0xE0020 <= cp <= 0xE007F)                # emoji tag sequences
+
+
+def _is_regional(ch):
+    return 0x1F1E6 <= ord(ch) <= 0x1F1FF
+
+
+def clusters(s):
+    """Split into user-perceived characters, approximately.
+
+    A base plus its combining marks must land in the same font and must never
+    be split by a line break or a truncation: a Devanagari vowel sign or a
+    Thai tone mark on its own is a different, broken string.
+    """
+    out = []
+    glue = False
+    for ch in s:
+        if out and (glue or _is_mark(ch)
+                    or (_is_regional(ch) and len(out[-1]) == 1
+                        and _is_regional(out[-1]))):
+            out[-1] += ch
+        else:
+            out.append(ch)
+        glue = ch == '\u200d'          # ZWJ glues the next character on too
+    return out
+
+
+_MIRROR = dict(zip('()[]{}<>\u00ab\u00bb', ')(][}{><\u00bb\u00ab'))
+
+
+def _strong(cluster):
+    d = unicodedata.bidirectional(cluster[0])
+    if d in ('R', 'AL'):
+        return 'R'
+    if d in ('L', 'EN', 'AN'):          # numbers read left-to-right everywhere
+        return 'L'
+    return None
+
+
+def _direction(rtl):
+    return {'direction': 'rtl'} if rtl else {}
+
+
+def visual_runs(s, faces):
+    """(text, face, rtl) runs in left-to-right display order.
+
+    A two-level bidi: enough to put right-to-left words in order and place
+    them correctly among left-to-right ones, which is all a lyric line needs.
+    """
+    cl = clusters(s)
+    dirs = [_strong(c) for c in cl]
+    para = next((d for d in dirs if d), 'L')
+    # Neutrals (spaces, punctuation) take their neighbours' direction when
+    # both agree, else the paragraph's.
+    res = list(dirs)
+    i = 0
+    while i < len(cl):
+        if dirs[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < len(cl) and dirs[j] is None:
+            j += 1
+        prev = res[i - 1] if i else para
+        nxt = dirs[j] if j < len(cl) else para
+        for k in range(i, j):
+            res[k] = prev if prev == nxt else para
+        i = j
+    druns = []
+    for c, d in zip(cl, res):
+        if druns and druns[-1][1] == d:
+            druns[-1][0].append(c)
+        else:
+            druns.append(([c], d))
+    if para == 'R':
+        druns.reverse()
+    out = []
+    for cs, d in druns:
+        rtl = d == 'R'
+        if rtl and not RAQM:
+            cs = [_MIRROR.get(c, c) for c in reversed(cs)]
+        runs = []
+        for c in cs:
+            face = faces.face_of(ord(c[0]))
+            # A mark the chosen face lacks would draw as a box after the base
+            # (a variation selector after an emoji, say); drop it instead.
+            c = c[0] + ''.join(m for m in c[1:] if face.has(ord(m)))
+            if runs and runs[-1][1] is face:
+                runs[-1][0] += c
+            else:
+                runs.append([c, face])
+        if rtl and RAQM:
+            runs.reverse()              # raqm reverses within each run itself
+        out += [(t, face, rtl and RAQM) for t, face in runs]
+    return out
+
+
+class FontChain:
+    """A font that falls back per character, so any script renders.
+
+    Quacks enough like an ImageFont for the layout code: getmetrics(),
+    getlength(), getbbox(), plus draw() in place of ImageDraw.text().
+    Metrics are the primary's, so adding a fallback never moves a layout.
+    """
+
+    def __init__(self, path, size, fallbacks=None):
+        self.faces = _Faces.get(path, FALLBACK_FAMILIES if fallbacks is None
+                                else fallbacks)
+        self.size = size
+        self.primary = self.faces.primary.at(size)
+        self._ascent = self.primary.getmetrics()[0]
+        self._widths = {}
+
+    def getmetrics(self):
+        return self.primary.getmetrics()
+
+    def runs(self, s):
+        return [(t, face.at(self.size), rtl)
+                for t, face, rtl in visual_runs(s, self.faces)]
+
+    def getlength(self, s):
+        w = self._widths.get(s)
+        if w is None:
+            w = sum(font.getlength(t, **_direction(rtl))
+                    for t, font, rtl in self.runs(s))
+            if len(self._widths) > 4096:
+                self._widths.clear()
+            self._widths[s] = w
+        return w
+
+    def getbbox(self, s):
+        """Ink box relative to the top-left draw() origin, like ImageFont's."""
+        x, box = 0.0, None
+        for t, font, rtl in self.runs(s):
+            b = font.getbbox(t, anchor='ls', **_direction(rtl))
+            b = (x + b[0], self._ascent + b[1], x + b[2], self._ascent + b[3])
+            box = b if box is None else (min(box[0], b[0]), min(box[1], b[1]),
+                                         max(box[2], b[2]), max(box[3], b[3]))
+            x += font.getlength(t, **_direction(rtl))
+        return tuple(int(round(v)) for v in box) if box else (0, 0, 0, 0)
+
+    def draw(self, draw, xy, s, fill=1):
+        # Every run sits on the primary's baseline; each face's own ascender
+        # differs, so the default top-left anchor would stagger them.
+        x, y = xy
+        base = y + self._ascent
+        for t, font, rtl in self.runs(s):
+            draw.text((x, base), t, font=font, fill=fill, anchor='ls',
+                      **_direction(rtl))
+            x += font.getlength(t, **_direction(rtl))
+
+
+_probe = ImageDraw.Draw(Image.new('1', (1, 1)))
+
+
+def text_length(s, font):
+    if isinstance(font, FontChain):
+        return font.getlength(s)
+    return _probe.textlength(s, font=font)
+
+
+def draw_string(draw, xy, s, font, fill=1):
+    if isinstance(font, FontChain):
+        font.draw(draw, xy, s, fill)
+    else:
+        draw.text(xy, s, font=font, fill=fill)
+
+
 def load_font(size):
-    """Truetype at `size` if Pillow has freetype, else the bundled bitmap font.
+    """A FontChain at `size` if Pillow has freetype, else the bitmap font.
 
     Gentoo's dev-python/pillow needs USE=truetype for the good path;
     without it this silently falls back and `size` is ignored.
@@ -151,7 +469,7 @@ def load_font(size):
             for name in ('DejaVuSansCondensed-Bold.ttf', 'DejaVuSans-Bold.ttf'):
                 p = os.path.join(d, name)
                 if os.path.exists(p):
-                    return ImageFont.truetype(p, size), True
+                    return FontChain(p, size), True
     except (OSError, ImportError):
         pass
     return ImageFont.load_default(), False
@@ -168,9 +486,9 @@ def render_text(lines, size=13, align='left'):
     lh = (font.getbbox('Ay')[3] + 2) if scalable else 13
     y = max(0, (HEIGHT - lh * len(lines)) // 2)
     for line in lines:
-        w = d.textlength(line, font=font)
+        w = text_length(line, font)
         x = {'left': 2, 'center': (WIDTH - w) // 2, 'right': WIDTH - w - 2}[align]
-        d.text((max(0, x), y), line, font=font, fill=1)
+        draw_string(d, (max(0, x), y), line, font)
         y += lh
     return img
 
@@ -342,11 +660,11 @@ def cmd_pipe(sink, args):
 def cmd_marquee(sink, args):
     """Scroll a long string right-to-left until interrupted."""
     font, _ = load_font(args.size)
-    probe = ImageDraw.Draw(Image.new('1', (1, 1)))
     text = args.text + '   ' + ('' if args.once else args.text)
-    w = int(probe.textlength(text, font=font)) + WIDTH
+    w = int(text_length(text, font)) + WIDTH
     strip = Image.new('1', (w, HEIGHT), 0)
-    ImageDraw.Draw(strip).text((WIDTH, (HEIGHT - args.size) // 2), text, font=font, fill=1)
+    draw_string(ImageDraw.Draw(strip), (WIDTH, (HEIGHT - args.size) // 2),
+                text, font)
     x = 0
     try:
         while True:
@@ -461,6 +779,7 @@ def cmd_info(sink, args):
     print(f'report      : {FB_LEN + 2}-byte feature report, cmd 0x{CMD:02X}')
     print(f'truetype    : {"yes" if scalable else "NO - Pillow lacks freetype; "
                            "run: euse -E truetype && emerge -1 dev-python/pillow"}')
+    print(f'shaping     : {"raqm " + (features.version("raqm") or "") if RAQM else "none - Arabic unjoined, Indic marks misplaced; Pillow needs USE=raqm"}')
     if status and status.get('device_error'):
         # Daemon alive but with no panel to draw on - previously this was only
         # discoverable by reading the log.

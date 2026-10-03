@@ -61,6 +61,25 @@ Requires Python 3.11+ (for `tomllib`) and Pillow **built with freetype** —
 without it everything falls back to a 6×11 bitmap font and font sizes are
 ignored. On Gentoo that's `USE=truetype` on `dev-python/pillow`.
 
+### Any script
+
+DejaVu has no Japanese, Chinese, Thai, Devanagari or emoji, and Pillow does no
+font fallback, so on its own those draw as empty boxes. Text goes through a
+`FontChain` instead: each character gets the first face that has it — DejaVu,
+then `[fonts] fallback` (default Noto Sans CJK JP, Noto Emoji), then
+fontconfig's ranking of every installed font, preferring the per-script Noto
+Sans faces. Install fonts for the scripts you need (`media-fonts/noto`,
+`media-fonts/noto-cjk`, `media-fonts/noto-emoji`).
+
+Lines in scripts without spaces (Japanese, Chinese, Thai) wrap between
+characters, following Japanese kinsoku rules — `、。` and small kana never start
+a line. Korean wraps at its spaces.
+
+For Arabic letters to join and Indic vowel signs to sit in the right place,
+Pillow also needs **libraqm** (`USE=raqm` on Gentoo). Without it right-to-left
+text is still put in reading order, but unshaped. `apex-oled info` shows which
+you have.
+
 ```bash
 git clone https://github.com/milescoviello/apex-oled ~/apex-oled
 ~/apex-oled/install.sh

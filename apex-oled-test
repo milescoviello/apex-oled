@@ -659,6 +659,91 @@ def t_compose_bounds():
         eq(out.size, (W, H), 'composed size')
 
 
+# --- any script ------------------------------------------------------------
+
+@check('clusters keep marks, flags, skin tones and ZWJ sequences whole')
+def t_clusters():
+    eq(apex.clusters('éa'), ['é', 'a'], 'combining accent')
+    eq(apex.clusters('नमस्ते'), ['न', 'म', 'स्', 'ते'], 'Devanagari signs')
+    eq(len(apex.clusters('\U0001F1EF\U0001F1F5\U0001F1FA\U0001F1F8')), 2, 'two flags')
+    eq(len(apex.clusters('\U0001F44D\U0001F3FD')), 1, 'skin tone')
+    eq(len(apex.clusters('\U0001F468‍\U0001F469‍\U0001F467')), 1,
+       'ZWJ family')
+
+
+@check('FontChain falls back per character and keeps the primary metrics')
+def t_fontchain():
+    font = oledd.Fonts(oledd.load_config('/nonexistent')).get(12)
+    if not isinstance(font, apex.FontChain):
+        return                          # no freetype: nothing to fall back in
+    eq(font.getmetrics(), font.primary.getmetrics(), 'metrics')
+    latin = apex.visual_runs('Distortion', font.faces)
+    eq(len(latin), 1, 'Latin is one run')
+    eq(latin[0][1] is font.faces.primary, True, 'Latin stays on the primary')
+    jp = apex.visual_runs('結束バンド', font.faces)
+    if jp[0][1] is font.faces.primary:
+        return                          # no CJK font installed on this machine
+    eq(len(jp), 1, 'Japanese is one run')
+    # Drawing must ink something real, not the primary's empty-box glyph.
+    a, b = Image.new('1', (40, 20), 0), Image.new('1', (40, 20), 0)
+    font.draw(ImageDraw.Draw(a), (0, 0), '結', 1)
+    ImageDraw.Draw(b).text((0, 0), '結', font=font.primary, fill=1)
+    if a.tobytes() == b.tobytes():
+        raise AssertionError('CJK drew the same as the primary font (a box)')
+
+
+@check('right-to-left runs come out in display order')
+def t_bidi():
+    font = oledd.Fonts(oledd.load_config('/nonexistent')).get(12)
+    if not isinstance(font, apex.FontChain):
+        return
+    runs = apex.visual_runs('abc אב', font.faces)
+    texts = [t for t, _, _ in runs]
+    want = ['abc ', 'אב'] if apex.RAQM else ['abc ', 'בא']
+    eq(texts, want, 'LTR paragraph with a Hebrew word')
+    runs = apex.visual_runs('שלום 2', font.faces)
+    eq(runs[0][0], '2', 'RTL paragraph: the trailing number sits leftmost')
+
+
+@check('lines without spaces wrap, obeying Japanese kinsoku')
+def t_wrap_unspaced():
+    font = oledd.Fonts(oledd.load_config('/nonexistent')).get(12)
+    eq(oledd.break_units('Blow by blow'),
+       [('Blow', ''), ('by', ' '), ('blow', ' ')], 'spaced text unchanged')
+    units = oledd.break_units('「孤独」ギターと、ヒーロー')
+    for u, _ in units[1:]:
+        if u[0] in oledd._NO_BREAK_BEFORE:
+            raise AssertionError(f'a line could start with {u[0]!r}: {units}')
+    for u, _ in units[:-1]:
+        if u[-1] in oledd._NO_BREAK_AFTER:
+            raise AssertionError(f'a line could end with {u[-1]!r}: {units}')
+    line = '踏みつけられた孤独とペダルから、何度も鳴り響く音色が頬に伝う'
+    rows = oledd.wrap(line, W - 4, font, lines=3)
+    if rows is None:
+        raise AssertionError('a long Japanese line did not wrap at all')
+    eq(''.join(rows), line, 'no characters lost or added')
+    for r in rows:
+        if oledd.text_width(r, font) > W - 4:
+            raise AssertionError(f'row too wide: {r}')
+    # Korean is spaced: it breaks between words, never inside one.
+    ko = '이 밤 그날의 반딧불을 당신의 창 가까이 보낼게요'
+    eq(' '.join(oledd.wrap(ko, W - 4, font, lines=3) or []), ko, 'Korean by word')
+
+
+@check('truncation never strands a vowel sign from its letter')
+def t_fit_clusters():
+    font = oledd.Fonts(oledd.load_config('/nonexistent')).get(12)
+    s = 'हम तेरे बिन अब रह नहीं सकते ' * 3
+    for avail in range(20, 120, 7):
+        out = oledd.fit(s, avail, font)
+        if not out.endswith('..'):
+            continue
+        kept = out[:-2]
+        nxt = s[len(kept.rstrip()):][:1] if s.startswith(kept.rstrip()) else ''
+        if nxt and apex._is_mark(nxt):
+            raise AssertionError(f'cut before a mark at {avail}px: {out!r}')
+
+
 _MANGO_HEAD = ('os,cpu,gpu,ram,kernel,driver,cpuscheduler\n'
                'Gentoo,Ultra 9,RTX 5090,32GB,7.2.8,595,\n'
                'fps,frametime,cpu_load,cpu_power,gpu_load,cpu_temp,gpu_temp,'
