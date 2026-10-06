@@ -581,7 +581,8 @@ def t_strata_views():
         generated=0, elapsed_s=5.0), now)
     eq((v['up'], v['state']), (True, 'reading'), 'early prefill state')
     eq((v['prefill']['frac'], v['prefill']['total'], v['prefill']['rate'],
-        v['prefill']['eta']), (0.0, 7927, None, None), 'early prefill numbers')
+        v['prefill']['eta'], v['prefill']['elapsed']), (0.0, 7927, None, None, 5.0),
+       'early prefill numbers')
 
     v = be.view(_STRATA_HEALTH, _strata_metrics(
         state='reading', prompt_tokens=7927, prompt_read=3000,
@@ -709,7 +710,7 @@ def t_strata_render():
     cold = {**_STRATA_HEALTH, 'loaded': False}
     for name, health, metrics in (
             ('early prefill', _STRATA_HEALTH,
-             _strata_metrics(state='reading', prompt_tokens=7927)),
+             _strata_metrics(state='reading', prompt_tokens=7927, elapsed_s=9.0)),
             ('mid prefill', _STRATA_HEALTH,
              _strata_metrics(state='reading', prompt_read=3000,
                              prompt_total=7927, prefill_tok_s_mean=1000.0)),

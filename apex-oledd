@@ -995,7 +995,7 @@ def qwen_view(**kw):
     prefill), generating. Unknown values are None.
     """
     v = {'backend': None, 'up': False, 'broken': False, 'state': 'off',
-         'prefill': None,       # {'frac', 'done', 'total', 'rate', 'eta'}
+         'prefill': None,       # {'frac', 'done', 'total', 'rate', 'eta', 'elapsed'}
          'live_tps': None,      # decode rate of the turn in flight
          'last_tps': None,      # the previous turn's average
          'gpu': None,           # {'util_pct', 'power_w', 'temp_c'}
@@ -1127,6 +1127,7 @@ class LlamaBackend:
                 'total': pf.get('tokens_total') or ctx_size,
                 'rate': pf.get('tok_per_s'),
                 'eta': pf.get('eta_s'),
+                'elapsed': pf.get('elapsed_s'),
             }
         ctx = self._ctx_used
         if ctx is None and pf.get('tokens_done') and ctx_size:
@@ -1199,7 +1200,8 @@ class StrataBackend:
             # prompt_read is the position reached, cached prefix included, so
             # a turn that reuses most of its context starts the bar far along.
             # The rate counts only fresh tokens, so the ETA is right either
-            # way. Both are null until the first chunk lands, a few seconds in.
+            # way. Both are null until the first chunk lands - about 9s into a
+            # 4k-token prompt - so until then elapsed time is all there is.
             total = live.get('prompt_total') or live.get('prompt_tokens')
             done = live.get('prompt_read') or 0
             rate = live.get('prefill_tok_s_mean') or None
@@ -1207,6 +1209,7 @@ class StrataBackend:
                 'frac': min(1.0, done / total) if total else 0.0,
                 'done': done, 'total': total, 'rate': rate,
                 'eta': (total - done) / rate if rate and total else None,
+                'elapsed': live.get('elapsed_s'),
             }
 
         if state == 'generating':
@@ -1395,9 +1398,13 @@ class QwenSource(Source):
             done, total = pf.get('done') or 0, pf.get('total')
             draw_text(img, (3, r2), f'{si_k(done)}/{si_k(total)}' if total
                       else si_k(done), ui)
-            eta = pf.get('eta')
+            eta, elapsed = pf.get('eta'), pf.get('elapsed')
             if eta is not None:
                 draw_right(img, 125, r2, f'eta {short_secs(eta)}', ui)
+            elif elapsed is not None:
+                # No rate yet, so no ETA - but a clock that keeps moving is
+                # what tells "working" from "hung" in the meantime.
+                draw_right(img, 125, r2, short_secs(elapsed), ui)
             return img
 
         # generating, or freshly finished
