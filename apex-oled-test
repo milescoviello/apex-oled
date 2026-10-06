@@ -367,14 +367,19 @@ def t_pause_reset():
         os.unlink(path)
 
 
-def _qwen(status, gen_seen=0.0):
-    """A QwenSource with its poller disabled and a status injected."""
+def _qwen_ctx():
+    """A context whose QwenSource poll thread exits immediately."""
     import threading
     ctx = _Ctx()
     ctx.stop = threading.Event()
-    ctx.stop.set()                      # the poll thread exits immediately
-    src = oledd.QwenSource(ctx)
-    src._status = status
+    ctx.stop.set()
+    return ctx
+
+
+def _qwen(status, gen_seen=0.0):
+    """A QwenSource with its poller disabled and a qwen-status reading injected."""
+    src = oledd.QwenSource(_qwen_ctx())
+    src._view = oledd.LlamaBackend(src.ctx).view(status) if status is not None else None
     src._gen_seen = gen_seen
     return src
 
@@ -407,49 +412,38 @@ def t_qwen_gating():
             raise AssertionError(f'{name}: active={got}, want {want}')
 
 
-@check('QwenSource fires on a prefill completing, not on a wobbling rate')
+@check('QwenSource fires on a turn finishing, not on a wobbling rate')
 def t_qwen_completion_trigger():
     import time
-    now = time.time()
-    src = _qwen(None)
-    busy = {'model_up': True, 'ctx_size': 1, 'gpu': {}, 'gen_tok_s': 24.9,
-            'prefill': {'complete': False, 'fraction': 0.5}}
-    done = {**busy, 'prefill': {'complete': True, 'fraction': 1.0}}
+    src = oledd.QwenSource(_qwen_ctx())
+    idle = oledd.qwen_view(up=True, state='idle', last_tps=24.9)
 
-    # a rolling gen_tok_s that merely wobbles must not look like fresh output;
+    # a rolling rate that merely wobbles must not look like fresh output;
     # this ping-ponged with the lyrics view every 10s in practice
-    src._status, src._prev_complete = done, True
     for rate in (24.9, 24.3, 99.9, 24.3):
-        src._status = {**done, 'gen_tok_s': rate}
-        pf = src._status['prefill']
-        complete = bool(pf.get('complete'))
-        if complete and src._prev_complete is False:
-            src._gen_seen = time.time()
-        src._prev_complete = complete
-    eq(src.active(now), False, 'wobbling gen_tok_s must not activate')
+        src._set_view({**idle, 'last_tps': rate})
+    eq(src.active(time.time()), False, 'wobbling rate must not activate')
 
-    # a real False -> True completion is news
-    src._prev_complete = False
-    pf = done['prefill']
-    if pf['complete'] and src._prev_complete is False:
-        src._gen_seen = time.time()
-    src._prev_complete = True
-    src._status = done
-    eq(src.active(time.time()), True, 'prefill completing activates')
+    # leaving a busy state is news, and stays news for GEN_FRESH
+    for busy in ('reading', 'generating'):
+        src._gen_seen = 0.0
+        src._set_view({**idle, 'state': busy})
+        eq(src.active(time.time()), True, f'{busy}: active while busy')
+        src._set_view(idle)
+        eq(src.active(time.time()), True, f'{busy} -> idle: activates')
+        eq(src.active(time.time() + src.GEN_FRESH + 1), False,
+           f'{busy} -> idle: yields after GEN_FRESH')
 
 
 @check('live decode rate comes from n_decoded deltas, not the stale average')
 def t_qwen_live_rate():
     import io
     import json as _json
-    import threading
     import urllib.request
 
-    ctx = _Ctx()
-    ctx.stop = threading.Event()
-    ctx.stop.set()
+    ctx = _qwen_ctx()
     ctx.cfg['qwen']['slots_url'] = 'http://stub/slots'
-    src = oledd.QwenSource(ctx)
+    be = oledd.LlamaBackend(ctx)
 
     clock = [1000.0]
     real_time, real_open = oledd.time.time, urllib.request.urlopen
@@ -470,22 +464,25 @@ def t_qwen_live_rate():
         for i in range(5):
             slot['next_token'][0]['n_decoded'] = i * 20
             clock[0] = 1000.0 + i
-            src._poll_slots()
-        if not (18 <= src._live_tps <= 22):
-            raise AssertionError(f'expected ~20 tok/s, got {src._live_tps}')
-        eq(src._ctx_used, (210000, 229376), 'context occupancy')
+            be._poll_slots()
+        if not (18 <= be._live_tps <= 22):
+            raise AssertionError(f'expected ~20 tok/s, got {be._live_tps}')
+        eq(be._ctx_used, (210000, 229376), 'context occupancy')
+        v = be.view({'model_up': True, 'gen_tok_s': 99.9})
+        eq((v['state'], v['live_tps'], v['ctx']),
+           ('generating', be._live_tps, (210000, 229376)), 'view mid-turn')
 
         # a new turn restarts the count; the stale rate must be dropped
         slot['next_token'][0]['n_decoded'] = 3
         clock[0] += 1
-        src._poll_slots()
-        eq(src._live_tps, None, 'rate cleared when n_decoded goes backwards')
+        be._poll_slots()
+        eq(be._live_tps, None, 'rate cleared when n_decoded goes backwards')
 
         # once the turn ends there is no live rate at all
         slot['is_processing'] = False
         clock[0] += 1
-        src._poll_slots()
-        eq(src._live_tps, None, 'no live rate while idle')
+        be._poll_slots()
+        eq(be._live_tps, None, 'no live rate while idle')
     finally:
         oledd.time.time = real_time
         urllib.request.urlopen = real_open
@@ -501,19 +498,22 @@ def t_qwen_stale_prefill():
     stale = {'model_up': True, 'ctx_size': 262144, 'gen_tok_s': 51.9,
              'gpu': {}, 'prefill': {'complete': False, 'fraction': 0.72,
                                     'tokens_done': 124373, 'eta_s': 62.9}}
-    src = _qwen(stale)
-    src._processing = False
-    src._ctx_used = (123760, 262144)     # /slots says nothing is running
-    eq(src.active(now), False, 'stale prefill with an idle server')
+    src = oledd.QwenSource(_qwen_ctx())
+    be = oledd.LlamaBackend(src.ctx)
 
+    def active(processing, ctx_used):
+        be._processing, be._ctx_used = processing, ctx_used
+        src._view = be.view(stale)
+        return src.active(now)
+
+    # /slots says nothing is running
+    eq(active(False, (123760, 262144)), False, 'stale prefill with an idle server')
+    eq(src._view['state'], 'idle', 'and it is drawn as idle, not a frozen bar')
     # the same state while the server really is working stays active
-    src._processing = True
-    eq(src.active(now), True, 'prefill with the server actually processing')
-
+    eq(active(True, (123760, 262144)), True,
+       'prefill with the server actually processing')
     # and with no /slots to cross-check, trust the status file
-    src._processing = False
-    src._ctx_used = None
-    eq(src.active(now), True, 'no /slots available, fall back to trusting it')
+    eq(active(False, None), True, 'no /slots available, fall back to trusting it')
 
 
 @check('QwenSource survives nulls and junk without crashing')
@@ -529,6 +529,9 @@ def t_qwen_null_safe():
                                  'prefill': {'complete': False}, 'gpu': None}),
             ('zero ctx', {'model_up': True, 'ctx_size': 0, 'prefill': None,
                           'gen_tok_s': 0.0, 'gpu': {}}),
+            ('null gpu readings', {'model_up': True, 'prefill': None,
+                                   'gpu': {'util_pct': None, 'power_w': None,
+                                           'temp_c': None}}),
     ):
         img = _qwen(st).render(now)
         if img is not None:
@@ -538,14 +541,11 @@ def t_qwen_null_safe():
 @check('QwenSource treats a failing qwen-status as "no idea", not a crash')
 def t_qwen_command_failure():
     import time
-    ctx = _Ctx()
-    import threading
-    ctx.stop = threading.Event()
-    ctx.stop.set()
+    ctx = _qwen_ctx()
     ctx.cfg['qwen']['command'] = '/nonexistent/qwen-status-missing'
     src = oledd.QwenSource(ctx)
     src._poll_once()                    # must not raise
-    eq(src._status, None, 'status after a failed command')
+    eq(src._view, None, 'view after a failed command')
     eq(src.active(time.time()), False, 'inactive when status is unknown')
     eq(src.render(time.time()), None, 'renders nothing when status is unknown')
 

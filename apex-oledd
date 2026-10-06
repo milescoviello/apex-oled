@@ -978,41 +978,44 @@ def short_secs(s):
     return f'{s // 3600}h{(s % 3600) // 60:02d}m'
 
 
-class QwenSource(Source):
-    """Local llama.cpp inference stats, chiefly prefill progress.
+def qwen_view(**kw):
+    """What QwenSource draws, whichever server it was read from.
 
-    A large session spends minutes ingesting its prompt before emitting a
-    single token, and nothing on screen distinguishes "working" from "hung".
-    That is the state worth surfacing, so this claims the panel only while
-    something is actually happening (see active()) and yields to the lyrics
-    view the rest of the time - the stack is idle most of the day.
+    state: off (no server running), unloaded (server up, weights not in
+    memory), idle, loading (a request is waiting on the weights), reading (a
+    prefill), generating. Unknown values are None.
+    """
+    v = {'backend': None, 'up': False, 'broken': False, 'state': 'off',
+         'prefill': None,       # {'frac', 'done', 'total', 'rate', 'eta'}
+         'live_tps': None,      # decode rate of the turn in flight
+         'last_tps': None,      # the previous turn's average
+         'gpu': None,           # {'util_pct', 'power_w', 'temp_c'}
+         'ctx': None}           # (tokens resident, window size)
+    v.update(kw)
+    return v
+
+
+BUSY_STATES = ('loading', 'reading', 'generating')
+
+
+class LlamaBackend:
+    """llama-server (qwen38, behind qwen-claude-proxy), read through
+    `qwen-status --json` plus llama-server's own /slots.
 
     `qwen-status --json` is the contract; its log parsing and nvidia-smi calls
-    stay on its side of the fence. Polling happens on a thread because it is a
-    subprocess and the render loop must not block on it.
+    stay on its side of the fence.
     """
-    name = 'qwen'
-    fps = 2.0
-
-    GEN_FRESH = 10.0        # treat a finished generation as news for this long
-    BUSY_POLL = 1.0
-    IDLE_POLL = 5.0
-    # Stack switched off: nothing to show, and qwen-status shells out to
-    # nvidia-smi on every call, so check back only occasionally. A prefill
-    # takes minutes, so noticing the stack 30s late costs nothing.
-    OFF_POLL = 30.0
+    name = 'llama'
+    # qwen-status shells out to nvidia-smi on every call, so idle polling is
+    # kept slow.
+    idle_poll = 5.0
 
     def __init__(self, ctx):
-        super().__init__(ctx)
-        self._status = None
-        self._gen_seen = 0.0
-        self._prev_complete = None
+        self.ctx = ctx
         self._ctx_used = None       # (tokens resident, n_ctx) from /slots
         self._processing = False    # a turn is in flight
         self._decode = None         # (t, n_decoded) for the live rate
         self._live_tps = None
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
 
     def _poll_slots(self):
         """True context occupancy, straight from llama-server.
@@ -1057,7 +1060,8 @@ class QwenSource(Source):
         except Exception:
             pass            # server down or endpoint absent: fall back below
 
-    def _poll_once(self):
+    def poll(self):
+        """A qwen_view, or None when qwen-status could not be read at all."""
         self._poll_slots()
         cmd = self.ctx.cfg['qwen'].get('command', 'qwen-status')
         try:
@@ -1069,71 +1073,129 @@ class QwenSource(Source):
         except (OSError, ValueError, subprocess.SubprocessError):
             # Missing script, dead server, truncated log mid-restart: all mean
             # "no idea", which must yield rather than wedge the display.
-            self._status = None
-            return
-        # "A generation just finished" is the prefill going complete, not a
-        # change in gen_tok_s. That number is a rolling figure that wobbles
-        # between samples (24.9 -> 24.3 with nothing running), and treating
-        # each wobble as news made this source seize the screen for 10s,
-        # release it, and seize it again - ping-ponging with the lyrics view.
+            return None
+        return self.view(st)
+
+    def view(self, st):
+        if not st.get('model_up'):
+            # The proxy only exists to front llama-server, so "proxy up, model
+            # down" means something died. Both down is just the stack switched
+            # off - the normal state at boot - and is not worth a screen.
+            return qwen_view(backend=self.name, broken=bool(st.get('proxy_up')))
+
         pf = st.get('prefill') or {}
-        complete = bool(pf.get('complete')) if pf else None
-        if complete and self._prev_complete is False:
+        ctx_size = st.get('ctx_size') or 0
+        # Only trust an incomplete prefill when the server agrees something is
+        # running. qwen-status leaves the last prefill behind when a request
+        # is interrupted - it sat at "72% complete, eta 63s" with the server
+        # idle - and believing it pinned this source active forever, locking
+        # every other view off the panel. With no /slots to cross-check
+        # against, it is all there is.
+        reading = bool(pf) and not pf.get('complete') and (
+            self._processing or self._ctx_used is None)
+        prefill = None
+        if reading:
+            prefill = {
+                'frac': pf.get('fraction') or 0.0,
+                'done': pf.get('tokens_done') or 0,
+                # This prefill's own workload, not the window: with prompt
+                # caching only the uncached tail gets processed, so "979/229k"
+                # would be nonsense. tokens_total is derived and wobbles a
+                # little, which is fine at this precision.
+                'total': pf.get('tokens_total') or ctx_size,
+                'rate': pf.get('tok_per_s'),
+                'eta': pf.get('eta_s'),
+            }
+        ctx = self._ctx_used
+        if ctx is None and pf.get('tokens_done') and ctx_size:
+            ctx = (pf['tokens_done'], ctx_size)     # /slots unavailable
+        return qwen_view(
+            backend=self.name, up=True, prefill=prefill, ctx=ctx,
+            state='reading' if reading else
+                  'generating' if self._processing else 'idle',
+            live_tps=self._live_tps, last_tps=st.get('gen_tok_s'),
+            gpu=st.get('gpu') or None)
+
+
+class QwenSource(Source):
+    """Local LLM inference stats, chiefly prefill progress.
+
+    A large session spends minutes ingesting its prompt before emitting a
+    single token, and nothing on screen distinguishes "working" from "hung".
+    That is the state worth surfacing, so this claims the panel only while
+    something is actually happening (see active()) and yields to the lyrics
+    view the rest of the time - the stack is idle most of the day.
+
+    Reading the server is a backend's job; each turns its own server's
+    numbers into a qwen_view, and everything below draws only that. Polling
+    happens on a thread because it involves a subprocess and HTTP, and the
+    render loop must not block on either.
+    """
+    name = 'qwen'
+    fps = 2.0
+
+    GEN_FRESH = 10.0        # keep showing a finished turn for this long
+    BUSY_POLL = 1.0
+    # Stack switched off: nothing to show, and qwen-status shells out to
+    # nvidia-smi on every call, so check back only occasionally. A prefill
+    # takes minutes, so noticing the stack 30s late costs nothing.
+    OFF_POLL = 30.0
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._view = None
+        self._backend = LlamaBackend(ctx)
+        self._gen_seen = 0.0
+        self._was_busy = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _poll_once(self):
+        self._set_view(self._backend.poll())
+
+    def _set_view(self, view):
+        # "A turn just finished" is the server leaving a busy state, not a
+        # change in the reported rate. gen_tok_s is a rolling figure that
+        # wobbles between samples (24.9 -> 24.3 with nothing running), and
+        # treating each wobble as news made this source seize the screen for
+        # 10s, release it, and seize it again - ping-ponging with the lyrics
+        # view.
+        busy = bool(view) and view['state'] in BUSY_STATES
+        if self._was_busy and not busy:
             self._gen_seen = time.time()
-        self._prev_complete = complete
-        self._status = st
-
-    @staticmethod
-    def _broken(st):
-        """The stack is running but its model server is not.
-
-        The proxy only exists to front llama-server, so "proxy up, model down"
-        means something died. Both down is just the stack switched off - the
-        normal state at boot - and is not worth a screen.
-        """
-        return bool(st.get('proxy_up')) and not st.get('model_up')
+        self._was_busy = busy
+        self._view = view
 
     def _loop(self):
         while not self.ctx.stop.is_set():
             self._poll_once()
-            st = self._status or {}
-            pf = st.get('prefill') or {}
-            if self._broken(st) or self._processing or (pf and not pf.get('complete')):
+            v = self._view or qwen_view()
+            if v['broken'] or v['state'] in BUSY_STATES:
                 wait = self.BUSY_POLL
-            elif not st.get('model_up') and not st.get('proxy_up'):
+            elif not v['up']:
                 wait = self.OFF_POLL
             else:
-                wait = self.IDLE_POLL
+                wait = self._backend.idle_poll
             if self.ctx.stop.wait(wait):
                 break
 
     def active(self, now):
         if not self.ctx.cfg['qwen'].get('enabled', True):
             return False
-        st = self._status
-        if not st:
+        v = self._view
+        if not v:
             return False
-        if self._broken(st):
+        if v['broken']:
             return True                     # a dead server is worth interrupting for
-        if not st.get('model_up'):
+        if not v['up']:
             return False                    # stack off: nothing to report
-        if self._processing:
+        if v['state'] in BUSY_STATES:
             return True                     # prefilling or generating right now
-        pf = st.get('prefill')
-        if pf and not pf.get('complete'):
-            # Only trust an incomplete prefill when the server agrees something
-            # is running. qwen-status leaves the last prefill behind when a
-            # request is interrupted - it sat at "72% complete, eta 63s" with
-            # the server idle - and believing it pinned this source active
-            # forever, locking every other view off the panel.
-            if self._ctx_used is None:
-                return True                 # no /slots to cross-check against
-            return False
         return (now - self._gen_seen) < self.GEN_FRESH
 
     def render(self, now):
-        st = self._status
-        if not st:
+        v = self._view
+        if not v:
             return None
         f = self.ctx.fonts
         ui = f.get(self.ctx.cfg['fonts']['ui_size'])
@@ -1141,7 +1203,7 @@ class QwenSource(Source):
         img = Image.new('1', (WIDTH, HEIGHT), 0)
         r0, r1, r2 = row_steps(ui, 3)
 
-        if self._broken(st):
+        if v['broken']:
             # Inverted so a dead server is unmistakable at a glance rather
             # than being one more line of small text. Draw white-on-black as
             # usual and flip the finished frame - drawing onto a white canvas
@@ -1149,57 +1211,48 @@ class QwenSource(Source):
             draw_centered(img, 4, 'QWEN', ui)
             draw_centered(img, 4 + line_height(ui), 'MODEL DOWN', big)
             return ImageOps.invert(img.convert('L')).convert('1')
-        if not st.get('model_up'):
+        if not v['up']:
             # Only reachable when pinned: switched off is not an alarm.
             draw_centered(img, 4, 'QWEN', ui)
             draw_centered(img, 4 + line_height(ui), 'stack off', big)
             return img
 
-        pf = st.get('prefill') or {}
-        gpu = st.get('gpu') or {}
-        ctx_size = st.get('ctx_size') or 0
-
-        if pf and not pf.get('complete'):
-            frac = pf.get('fraction') or 0.0
+        pf = v['prefill']
+        if v['state'] == 'reading' and pf:
+            frac = pf.get('frac') or 0.0
             draw_text(img, (3, r0), 'FILL', ui)
             draw_centered(img, r0, f'{frac * 100:.0f}%', ui, 40, 88)
-            rate = pf.get('tok_per_s')
+            rate = pf.get('rate')
             draw_right(img, 125, r0, f'{rate:.0f}/s' if rate else '--', ui)
 
             draw_bar(img, (3, r1 + 2, 125, r1 + 9), frac)
 
-            done = pf.get('tokens_done') or 0
-            # This prefill's own workload, not the window: with prompt caching
-            # only the uncached tail gets processed, so "979/229k" would be
-            # nonsense. tokens_total is derived and wobbles a little, which is
-            # fine at this precision.
-            total = pf.get('tokens_total') or ctx_size
-            draw_text(img, (3, r2), f'{si_k(done)}/{si_k(total)}', ui)
-            eta = pf.get('eta_s')
+            done, total = pf.get('done') or 0, pf.get('total')
+            draw_text(img, (3, r2), f'{si_k(done)}/{si_k(total)}' if total
+                      else si_k(done), ui)
+            eta = pf.get('eta')
             if eta is not None:
                 draw_right(img, 125, r2, f'eta {short_secs(eta)}', ui)
             return img
 
         # generating, or freshly finished
         draw_text(img, (3, r0), 'QWEN', ui)
-        gen = st.get('gen_tok_s')
-        if self._live_tps:
-            rate = f'{self._live_tps:.1f} t/s'
-        elif gen is not None:
+        if v['live_tps']:
+            rate = f"{v['live_tps']:.1f} t/s"
+        elif v['last_tps'] is not None:
             # "last" so a stale average never masquerades as the current speed
-            rate = f'{gen:.0f} t/s last'
+            rate = f"{v['last_tps']:.0f} t/s last"
         else:
             rate = 'idle'
         draw_right(img, 125, r0, rate, ui)
 
+        gpu = v['gpu']
         if gpu:
             draw_text(img, (3, r1), 'GPU', ui)
-            draw_centered(img, r1, f"{gpu.get('util_pct', 0)}%", ui, 30, 70)
-            draw_centered(img, r1, f"{gpu.get('power_w', 0):.0f}W", ui, 66, 102)
-            draw_right(img, 125, r1, f"{gpu.get('temp_c', 0)}c", ui)
-        used, total = self._ctx_used or (None, None)
-        if used is None:                    # /slots unavailable
-            used, total = (pf or {}).get('tokens_done'), ctx_size
+            draw_centered(img, r1, f"{gpu.get('util_pct') or 0}%", ui, 30, 70)
+            draw_centered(img, r1, f"{gpu.get('power_w') or 0:.0f}W", ui, 66, 102)
+            draw_right(img, 125, r1, f"{gpu.get('temp_c') or 0}c", ui)
+        used, total = v['ctx'] or (None, None)
         if used and total:
             draw_text(img, (3, r2), f'ctx {si_k(used)}/{si_k(total)}', ui)
             draw_bar(img, (76, r2 + 2, 125, r2 + 9), used / total)
