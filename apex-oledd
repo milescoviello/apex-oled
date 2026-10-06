@@ -120,10 +120,19 @@ DEFAULTS = {
         'tracks': {},
     },
     'qwen': {
-        # Local llama.cpp inference stats. Only claims the screen during a
-        # prefill, just after a generation, or when the model server has died
-        # under a running proxy (both down = stack off, which stays quiet).
+        # Local LLM inference stats. Only claims the screen during a prefill
+        # or generation, just after one, or when the model server is down
+        # while something still depends on it (a bare stack-off stays quiet).
         'enabled': True,
+        # Which server to read: 'strata' (flashnext-serve, what omp talks
+        # to), 'llama' (llama-server via qwen-status), or 'auto' for
+        # whichever is up, trying Strata first.
+        'backend': 'auto',
+        'strata_url': 'http://127.0.0.1:8099',
+        # Programs that only make sense with a local model up. One running
+        # while no server answers means its requests are failing: MODEL DOWN.
+        'clients': ['omp'],
+        # llama.cpp backend
         'command': 'qwen-status',
         # Real context occupancy. prefill.tokens_done is only the incremental
         # prefill, so it cannot answer "how full is the window".
@@ -998,6 +1007,31 @@ def qwen_view(**kw):
 BUSY_STATES = ('loading', 'reading', 'generating')
 
 
+class DecodeRate:
+    """Live tok/s from a turn's running token count, sampled once a poll.
+
+    Smoothed: raw samples swing 18-25 tok/s between ticks on llama.cpp, and
+    40-100 on Strata, whose speculative decoding lands tokens in bursts.
+    """
+
+    def __init__(self):
+        self._last = None           # (t, n)
+        self.tps = None
+
+    def update(self, n, now):
+        """n: tokens generated so far this turn, None when nothing is."""
+        prev, self._last = self._last, (now, n)
+        if n is None:
+            self._last = self.tps = None
+        elif prev and now > prev[0]:
+            if n < prev[1]:
+                self.tps = None             # a new turn began
+            elif n > prev[1]:
+                r = (n - prev[1]) / (now - prev[0])
+                self.tps = r if self.tps is None else 0.6 * self.tps + 0.4 * r
+        return self.tps
+
+
 class LlamaBackend:
     """llama-server (qwen38, behind qwen-claude-proxy), read through
     `qwen-status --json` plus llama-server's own /slots.
@@ -1014,8 +1048,7 @@ class LlamaBackend:
         self.ctx = ctx
         self._ctx_used = None       # (tokens resident, n_ctx) from /slots
         self._processing = False    # a turn is in flight
-        self._decode = None         # (t, n_decoded) for the live rate
-        self._live_tps = None
+        self._rate = DecodeRate()
 
     def _poll_slots(self):
         """True context occupancy, straight from llama-server.
@@ -1045,18 +1078,7 @@ class LlamaBackend:
             # you want mid-generation. gen_tok_s is the previous turn's
             # average and can be minutes stale.
             n = ((slot.get('next_token') or [{}])[0] or {}).get('n_decoded')
-            now = time.time()
-            prev, self._decode = self._decode, (now, n)
-            if n is None or not self._processing:
-                self._decode = self._live_tps = None
-            elif prev and prev[1] is not None and now > prev[0]:
-                if n < prev[1]:
-                    self._live_tps = None       # a new turn began
-                elif n > prev[1]:
-                    r = (n - prev[1]) / (now - prev[0])
-                    # Smoothed: raw samples swing 18-25 tok/s between ticks.
-                    self._live_tps = r if self._live_tps is None else (
-                        0.6 * self._live_tps + 0.4 * r)
+            self._rate.update(n if self._processing else None, time.time())
         except Exception:
             pass            # server down or endpoint absent: fall back below
 
@@ -1113,8 +1135,121 @@ class LlamaBackend:
             backend=self.name, up=True, prefill=prefill, ctx=ctx,
             state='reading' if reading else
                   'generating' if self._processing else 'idle',
-            live_tps=self._live_tps, last_tps=st.get('gen_tok_s'),
+            live_tps=self._rate.tps, last_tps=st.get('gen_tok_s'),
             gpu=st.get('gpu') or None)
+
+
+class StrataBackend:
+    """Strata (flashnext-serve), the server omp talks to directly.
+
+    No log parsing or nvidia-smi: /metrics already says what the server is
+    doing (reading the prompt, generating), how far along it is, and how the
+    GPU is doing, from its own bookkeeping. /health adds whether the weights
+    are in memory - Strata frees the GPU after a quiet spell and reloads on
+    the next request, which takes about a minute.
+    """
+    name = 'strata'
+    # Two localhost GETs. Cheap, and omp's turns are often only seconds long.
+    idle_poll = 2.0
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self._rate = DecodeRate()
+
+    @staticmethod
+    def _get(url):
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=3) as r:
+            v = json.load(r)
+        return v if isinstance(v, dict) else {}
+
+    def poll(self):
+        """A qwen_view; stack off when the server does not answer."""
+        base = (self.ctx.cfg['qwen'].get('strata_url') or '').rstrip('/')
+        if not base:
+            return None
+        try:
+            health = self._get(base + '/health')
+        except Exception:
+            self._rate.update(None, time.time())
+            return qwen_view(backend=self.name)
+        try:
+            metrics = self._get(base + '/metrics')
+        except Exception:
+            metrics = {}        # up but not saying more (an API key, say)
+        return self.view(health, metrics, time.time())
+
+    def view(self, health, metrics, now):
+        live = metrics.get('live') or {}
+        hw = metrics.get('hardware') or {}
+        reqs = metrics.get('requests') or []
+        last = reqs[0] if reqs and isinstance(reqs[0], dict) else {}
+        loaded = health.get('loaded') is not False
+        window = health.get('max_context') or (
+            metrics.get('engine') or {}).get('max_context')
+
+        state = live.get('state')
+        if state == 'reading' and not loaded:
+            state = 'loading'           # a request woke the unloaded model
+        elif state not in ('reading', 'generating', 'unloaded'):
+            state = 'idle' if loaded else 'unloaded'
+
+        prefill = None
+        if state == 'reading':
+            # prompt_read is the position reached, cached prefix included, so
+            # a turn that reuses most of its context starts the bar far along.
+            # The rate counts only fresh tokens, so the ETA is right either
+            # way. Both are null until the first chunk lands, a few seconds in.
+            total = live.get('prompt_total') or live.get('prompt_tokens')
+            done = live.get('prompt_read') or 0
+            rate = live.get('prefill_tok_s_mean') or None
+            prefill = {
+                'frac': min(1.0, done / total) if total else 0.0,
+                'done': done, 'total': total, 'rate': rate,
+                'eta': (total - done) / rate if rate and total else None,
+            }
+
+        if state == 'generating':
+            # Strata reports a tok_s of its own, but over a short window that
+            # swings 40-100 under speculative decoding; differencing the
+            # count once a poll and smoothing it reads steadier.
+            self._rate.update(live.get('generated') or 0, now)
+            used = (live.get('prompt_tokens') or 0) + (live.get('generated') or 0)
+        else:
+            self._rate.update(None, now)
+            used = (live.get('prompt_read') if state == 'reading' else
+                    (last.get('prompt_tokens') or 0) + (last.get('output_tokens') or 0))
+
+        gpu = None
+        if hw.get('gpu_util') is not None:
+            gpu = {'util_pct': hw.get('gpu_util'), 'power_w': hw.get('gpu_power'),
+                   'temp_c': hw.get('gpu_temp')}
+        return qwen_view(
+            backend=self.name, up=True, state=state, prefill=prefill,
+            live_tps=self._rate.tps, last_tps=last.get('decode_tok_s'),
+            gpu=gpu, ctx=(used, window) if used and window else None)
+
+
+def process_running(names):
+    """True when a process was started as one of `names`, by basename.
+
+    argv[1] counts too, so programs run by an interpreter are found: omp is
+    `bun /path/to/omp`.
+    """
+    want = set(names)
+    if not want:
+        return False
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                argv = f.read().split(b'\0')[:2]
+        except OSError:
+            continue
+        if any(os.path.basename(a.decode(errors='replace')) in want for a in argv):
+            return True
+    return False
 
 
 class QwenSource(Source):
@@ -1127,15 +1262,20 @@ class QwenSource(Source):
     view the rest of the time - the stack is idle most of the day.
 
     Reading the server is a backend's job; each turns its own server's
-    numbers into a qwen_view, and everything below draws only that. Polling
-    happens on a thread because it involves a subprocess and HTTP, and the
-    render loop must not block on either.
+    numbers into a qwen_view, and everything below draws only that. Strata
+    is what omp uses; llama.cpp is the older qwen38 stack. Polling happens on
+    a thread because it involves a subprocess and HTTP, and the render loop
+    must not block on either.
     """
     name = 'qwen'
     fps = 2.0
 
     GEN_FRESH = 10.0        # keep showing a finished turn for this long
     BUSY_POLL = 1.0
+    # A dead server can stay dead for hours with omp left open, and each
+    # check may run qwen-status and so nvidia-smi; a few seconds to notice it
+    # coming back is plenty.
+    BROKEN_POLL = 5.0
     # Stack switched off: nothing to show, and qwen-status shells out to
     # nvidia-smi on every call, so check back only occasionally. A prefill
     # takes minutes, so noticing the stack 30s late costs nothing.
@@ -1144,14 +1284,35 @@ class QwenSource(Source):
     def __init__(self, ctx):
         super().__init__(ctx)
         self._view = None
-        self._backend = LlamaBackend(ctx)
+        self._backends = {b.name: b for b in (StrataBackend(ctx), LlamaBackend(ctx))}
         self._gen_seen = 0.0
         self._was_busy = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def _poll_once(self):
-        self._set_view(self._backend.poll())
+        cfg = self.ctx.cfg['qwen']
+        want = cfg.get('backend', 'auto')
+        order = [self._backends[want]] if want in self._backends else \
+            list(self._backends.values())
+        view = None
+        for be in order:
+            v = be.poll()
+            if v is None:
+                continue                    # could not tell: try the next
+            if v['up']:
+                view = v
+                break
+            if view is None or v['broken']:
+                view = v                    # nothing up; keep the worst news
+        # A client of the local model with no server answering is the same
+        # failure "proxy up, model down" was for llama.cpp: its requests are
+        # going nowhere. Without one, both down is just the stack switched
+        # off, the normal state at boot.
+        if view is not None and not view['up'] and not view['broken'] \
+                and process_running(cfg.get('clients') or []):
+            view = {**view, 'broken': True}
+        self._set_view(view)
 
     def _set_view(self, view):
         # "A turn just finished" is the server leaving a busy state, not a
@@ -1170,12 +1331,14 @@ class QwenSource(Source):
         while not self.ctx.stop.is_set():
             self._poll_once()
             v = self._view or qwen_view()
-            if v['broken'] or v['state'] in BUSY_STATES:
+            if v['broken']:
+                wait = self.BROKEN_POLL
+            elif v['state'] in BUSY_STATES:
                 wait = self.BUSY_POLL
             elif not v['up']:
                 wait = self.OFF_POLL
             else:
-                wait = self._backend.idle_poll
+                wait = self._backends[v['backend']].idle_poll
             if self.ctx.stop.wait(wait):
                 break
 
@@ -1211,10 +1374,12 @@ class QwenSource(Source):
             draw_centered(img, 4, 'QWEN', ui)
             draw_centered(img, 4 + line_height(ui), 'MODEL DOWN', big)
             return ImageOps.invert(img.convert('L')).convert('1')
-        if not v['up']:
-            # Only reachable when pinned: switched off is not an alarm.
+        if not v['up'] or v['state'] in ('loading', 'unloaded'):
+            # Switched off and unloaded are only reachable when pinned; they
+            # are not alarms. Loading is a request waiting on the weights.
             draw_centered(img, 4, 'QWEN', ui)
-            draw_centered(img, 4 + line_height(ui), 'stack off', big)
+            draw_centered(img, 4 + line_height(ui),
+                          v['state'] if v['up'] else 'stack off', big)
             return img
 
         pf = v['prefill']

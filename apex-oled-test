@@ -368,11 +368,13 @@ def t_pause_reset():
 
 
 def _qwen_ctx():
-    """A context whose QwenSource poll thread exits immediately."""
+    """A context whose QwenSource poll thread exits immediately, and which
+    cannot see the real machine: no Strata URL, no client processes."""
     import threading
     ctx = _Ctx()
     ctx.stop = threading.Event()
     ctx.stop.set()
+    ctx.cfg['qwen'].update(strata_url='', clients=[])
     return ctx
 
 
@@ -465,24 +467,24 @@ def t_qwen_live_rate():
             slot['next_token'][0]['n_decoded'] = i * 20
             clock[0] = 1000.0 + i
             be._poll_slots()
-        if not (18 <= be._live_tps <= 22):
-            raise AssertionError(f'expected ~20 tok/s, got {be._live_tps}')
+        if not (18 <= be._rate.tps <= 22):
+            raise AssertionError(f'expected ~20 tok/s, got {be._rate.tps}')
         eq(be._ctx_used, (210000, 229376), 'context occupancy')
         v = be.view({'model_up': True, 'gen_tok_s': 99.9})
         eq((v['state'], v['live_tps'], v['ctx']),
-           ('generating', be._live_tps, (210000, 229376)), 'view mid-turn')
+           ('generating', be._rate.tps, (210000, 229376)), 'view mid-turn')
 
         # a new turn restarts the count; the stale rate must be dropped
         slot['next_token'][0]['n_decoded'] = 3
         clock[0] += 1
         be._poll_slots()
-        eq(be._live_tps, None, 'rate cleared when n_decoded goes backwards')
+        eq(be._rate.tps, None, 'rate cleared when n_decoded goes backwards')
 
         # once the turn ends there is no live rate at all
         slot['is_processing'] = False
         clock[0] += 1
         be._poll_slots()
-        eq(be._live_tps, None, 'no live rate while idle')
+        eq(be._rate.tps, None, 'no live rate while idle')
     finally:
         oledd.time.time = real_time
         urllib.request.urlopen = real_open
@@ -548,6 +550,187 @@ def t_qwen_command_failure():
     eq(src._view, None, 'view after a failed command')
     eq(src.active(time.time()), False, 'inactive when status is unknown')
     eq(src.render(time.time()), None, 'renders nothing when status is unknown')
+
+
+# Shapes recorded from a live Strata 0.1.39 (flashnext-serve) during omp turns.
+_STRATA_HEALTH = {'status': 'ok', 'max_context': 131072, 'loaded': True,
+                  'model': 'flashnext-abliterated-iq2_xs', 'service': 'strata'}
+_STRATA_LAST = {'prompt_tokens': 22958, 'reused': 22927, 'output_tokens': 34,
+                'prompt_total': 22958, 'prompt_read': 31, 'decode_tok_s': 67.4,
+                'finish': 'stop'}
+_STRATA_HW = {'gpu_util': 96, 'gpu_temp': 74, 'gpu_power': 135.6,
+              'gpu_mem_used': 25428885504, 'gpu_mem_total': 25651314688}
+
+
+def _strata_metrics(**live):
+    base = {'state': 'idle', 'queued': 0, 'phase': None, 'prompt_tokens': None,
+            'prompt_read': None, 'prompt_total': None, 'generated': None,
+            'elapsed_s': None, 'tok_s': None, 'prefill_tok_s_mean': None}
+    return {'engine': {'max_context': 131072}, 'live': {**base, **live},
+            'requests': [_STRATA_LAST], 'hardware': _STRATA_HW}
+
+
+@check('StrataBackend maps /health + /metrics onto the shared view')
+def t_strata_views():
+    be = oledd.StrataBackend(_qwen_ctx())
+    now = 1000.0
+
+    # before the first chunk lands, only the prompt length is known
+    v = be.view(_STRATA_HEALTH, _strata_metrics(
+        state='reading', phase='reading the prompt', prompt_tokens=7927,
+        generated=0, elapsed_s=5.0), now)
+    eq((v['up'], v['state']), (True, 'reading'), 'early prefill state')
+    eq((v['prefill']['frac'], v['prefill']['total'], v['prefill']['rate'],
+        v['prefill']['eta']), (0.0, 7927, None, None), 'early prefill numbers')
+
+    v = be.view(_STRATA_HEALTH, _strata_metrics(
+        state='reading', prompt_tokens=7927, prompt_read=3000,
+        prompt_total=7927, prefill_tok_s_mean=1000.0), now)
+    pf = v['prefill']
+    eq((pf['done'], pf['total'], pf['rate']), (3000, 7927, 1000.0), 'mid prefill')
+    if abs(pf['frac'] - 3000 / 7927) > 1e-9 or abs(pf['eta'] - 4.927) > 1e-9:
+        raise AssertionError(f'frac/eta: {pf}')
+
+    v = be.view(_STRATA_HEALTH, _strata_metrics(
+        state='generating', phase='thinking', prompt_tokens=9555,
+        generated=137, tok_s=46.4), now)
+    eq(v['state'], 'generating', 'generating state')
+    eq(v['ctx'], (9555 + 137, 131072), 'context while generating: prompt + output')
+    eq(v['last_tps'], 67.4, 'previous turn rate')
+    eq(v['gpu'], {'util_pct': 96, 'power_w': 135.6, 'temp_c': 74}, 'gpu')
+
+    v = be.view(_STRATA_HEALTH, _strata_metrics(), now)
+    eq((v['state'], v['prefill'], v['live_tps']), ('idle', None, None), 'idle')
+    eq(v['ctx'], (22958 + 34, 131072), 'context at rest: the last turn')
+
+    # Strata frees the GPU after a quiet spell; a request then waits ~60s on
+    # the weights, which is worth showing, unlike the unloaded state itself
+    cold = {**_STRATA_HEALTH, 'loaded': False}
+    eq(be.view(cold, _strata_metrics(state='reading', prompt_tokens=500), now)['state'],
+       'loading', 'request waiting on the weights')
+    eq(be.view(cold, _strata_metrics(state='unloaded'), now)['state'],
+       'unloaded', 'unloaded')
+    eq(be.view(cold, {}, now)['state'], 'unloaded', 'unloaded, no metrics')
+    eq(be.view(_STRATA_HEALTH, {}, now)['state'], 'idle', 'up, no metrics')
+
+
+@check('StrataBackend smooths the decode rate and drops it between turns')
+def t_strata_rate():
+    be = oledd.StrataBackend(_qwen_ctx())
+    gen = lambda n: _strata_metrics(state='generating', prompt_tokens=9555,
+                                    generated=n)
+    # speculative decoding lands tokens in bursts: 40, 80, 40, 80 a second
+    n, t = 0, 1000.0
+    for step in (40, 80, 40, 80, 40, 80):
+        n, t = n + step, t + 1.0
+        v = be.view(_STRATA_HEALTH, gen(n), t)
+    if not (50 <= v['live_tps'] <= 70):
+        raise AssertionError(f'expected ~60 tok/s, got {v["live_tps"]}')
+    v = be.view(_STRATA_HEALTH, _strata_metrics(), t + 1)
+    eq(v['live_tps'], None, 'no live rate once idle')
+    be.view(_STRATA_HEALTH, gen(400), t + 2)
+    v = be.view(_STRATA_HEALTH, gen(5), t + 3)
+    eq(v['live_tps'], None, 'a new turn restarts the count')
+
+
+@check('StrataBackend reads an unreachable server as stack off')
+def t_strata_unreachable():
+    ctx = _qwen_ctx()
+    be = oledd.StrataBackend(ctx)
+    eq(be.poll(), None, 'no URL configured: no opinion')
+    ctx.cfg['qwen']['strata_url'] = 'http://127.0.0.1:9'     # discard: refused
+    v = be.poll()
+    eq((v['backend'], v['up'], v['broken'], v['state']),
+       ('strata', False, False, 'off'), 'refused connection')
+
+
+class _FakeBackend:
+    def __init__(self, name, view, idle_poll=5.0):
+        self.name, self.idle_poll, self._v, self.polled = name, idle_poll, view, 0
+
+    def poll(self):
+        self.polled += 1
+        return self._v
+
+
+@check('QwenSource picks the server that is up, and alarms for a stranded client')
+def t_qwen_backend_choice():
+    real = oledd.process_running
+    up = lambda name: oledd.qwen_view(backend=name, up=True, state='idle')
+    off = lambda name, broken=False: oledd.qwen_view(backend=name, broken=broken)
+
+    def run(strata, llama, backend='auto', client=False):
+        src = oledd.QwenSource(_qwen_ctx())
+        src.ctx.cfg['qwen']['backend'] = backend
+        fakes = [_FakeBackend('strata', strata), _FakeBackend('llama', llama)]
+        src._backends = {b.name: b for b in fakes}
+        oledd.process_running = lambda names: client
+        src._poll_once()
+        return src._view, fakes
+
+    try:
+        v, (s, l) = run(up('strata'), up('llama'))
+        eq((v['backend'], l.polled), ('strata', 0), 'Strata first; llama not polled')
+        v, _ = run(off('strata'), up('llama'))
+        eq(v['backend'], 'llama', 'falls back to llama.cpp')
+        v, _ = run(off('strata'), off('llama'))
+        eq((v['up'], v['broken']), (False, False), 'both off: stack off, quiet')
+        v, _ = run(off('strata'), None)
+        eq((v['up'], v['broken']), (False, False), 'qwen-status missing: still off')
+        v, _ = run(off('strata'), off('llama'), client=True)
+        eq(v['broken'], True, 'omp running with nothing to talk to')
+        v, _ = run(off('strata'), off('llama', broken=True))
+        eq(v['broken'], True, 'llama proxy up, model down')
+        v, _ = run(up('strata'), up('llama'), client=True)
+        eq(v['broken'], False, 'a client with a server up is fine')
+        v, (s, l) = run(up('strata'), up('llama'), backend='llama')
+        eq((v['backend'], s.polled), ('llama', 0), 'backend pinned to llama')
+        v, _ = run(None, None)
+        eq(v, None, 'nobody could tell')
+    finally:
+        oledd.process_running = real
+
+
+@check('process_running finds programs by name, interpreters included')
+def t_process_running():
+    with open('/proc/self/cmdline', 'rb') as f:
+        argv = [a.decode() for a in f.read().split(b'\0') if a]
+    eq(oledd.process_running([os.path.basename(argv[0])]), True, 'argv[0]')
+    eq(oledd.process_running([os.path.basename(argv[1])]), True,
+       'argv[1], as with `bun /path/to/omp`')
+    eq(oledd.process_running(['no-such-program-apex-oled']), False, 'absent')
+    eq(oledd.process_running([]), False, 'nothing to look for')
+
+
+@check('QwenSource draws every Strata state, junk included')
+def t_strata_render():
+    src = oledd.QwenSource(_qwen_ctx())
+    be = oledd.StrataBackend(src.ctx)
+    cold = {**_STRATA_HEALTH, 'loaded': False}
+    for name, health, metrics in (
+            ('early prefill', _STRATA_HEALTH,
+             _strata_metrics(state='reading', prompt_tokens=7927)),
+            ('mid prefill', _STRATA_HEALTH,
+             _strata_metrics(state='reading', prompt_read=3000,
+                             prompt_total=7927, prefill_tok_s_mean=1000.0)),
+            ('generating', _STRATA_HEALTH,
+             _strata_metrics(state='generating', prompt_tokens=9555, generated=1)),
+            ('idle', _STRATA_HEALTH, _strata_metrics()),
+            ('loading', cold, _strata_metrics(state='reading')),
+            ('unloaded', cold, _strata_metrics(state='unloaded')),
+            ('empty', {}, {}),
+            ('null blocks', _STRATA_HEALTH,
+             {'live': None, 'requests': None, 'hardware': None, 'engine': None}),
+            ('junk request', _STRATA_HEALTH, {'requests': ['x'], 'live': {}}),
+            ('null gpu readings', _STRATA_HEALTH,
+             {'hardware': {'gpu_util': 5, 'gpu_power': None, 'gpu_temp': None}}),
+    ):
+        src._view = be.view(health, metrics, 1000.0)
+        img = src.render(1000.0)
+        eq(img.size, (W, H), f'{name} frame size')
+        if name in ('loading', 'unloaded', 'mid prefill', 'generating'):
+            if img.getbbox() is None:
+                raise AssertionError(f'{name}: blank frame')
 
 
 @check('si_k / short_secs format for a 128px panel')
