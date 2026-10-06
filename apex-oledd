@@ -762,6 +762,7 @@ class NotifySource(Source):
         with self._lock:
             self._frame = img
             self._expires = time.time() + max(0.1, secs)
+        self.ctx.wake.set()     # show it now, even over an away-blank
 
     def clear(self):
         with self._lock:
@@ -2131,6 +2132,7 @@ class Presence(threading.Thread):
             ready, _, _ = select.select(list(self.fds.values()), [], [], 1.0)
             if self.drain(ready):
                 self.last_input = time.monotonic()
+                self.ctx.wake.set()
                 self.ctx.stop.wait(self.SETTLE)
         self.close()
 
@@ -2272,6 +2274,9 @@ class Context:
         self.s = Sensors()
         self.fonts = Fonts(cfg)
         self.stop = threading.Event()
+        # Cuts short the main loop's wait while blanked, so input or a new
+        # notification lights the panel now rather than up to a second later.
+        self.wake = threading.Event()
         self.current_source = None
         self.blanked = False
         self.blank_reason = None    # while blanked: what should_blank() said
@@ -2425,7 +2430,7 @@ def run(args):
     server.start()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: ctx.stop.set())
+        signal.signal(sig, lambda *_: (ctx.stop.set(), ctx.wake.set()))
 
     def log(msg):
         if args.verbose:
@@ -2497,7 +2502,11 @@ def run(args):
                     last_fb, ctx.blanked = None, True
                     log(f'blanked ({why})')
                 ctx.blank_reason = why
-                ctx.stop.wait(1.0)
+                # Sleep until something happens rather than a flat second: a
+                # keypress should light the panel as it lands. Cleared before
+                # the next check, so a wake arriving after it is not lost.
+                ctx.wake.wait(1.0)
+                ctx.wake.clear()
                 continue
             if ctx.blanked:
                 log('unblanked')

@@ -11,6 +11,7 @@ import os
 import random
 import sys
 import tempfile
+import threading
 from importlib.machinery import SourceFileLoader
 
 from PIL import Image, ImageDraw
@@ -183,6 +184,7 @@ class _Ctx:
         self.cfg = oledd.load_config('/nonexistent')
         self.fonts = oledd.Fonts(self.cfg)
         self.s = None
+        self.wake = threading.Event()
 
 
 @check('LyricsSource renders every layout branch to a valid frame')
@@ -774,6 +776,7 @@ def t_notify_expiry():
     eq(n.active(now), False, 'empty notify source')
     n.push(Image.new('1', (W, H), 0), 0.5)
     eq(n.active(now), True, 'just pushed')
+    eq(ctx.wake.is_set(), True, 'a push wakes a blanked main loop')
     eq(n.active(now + 5), False, 'after expiry')
 
 
@@ -1047,6 +1050,7 @@ def t_presence_thread():
         while p.away() and time.monotonic() < deadline:
             time.sleep(0.01)
         eq(p.away(), False, 'back after mouse motion')
+        eq(ctx.wake.is_set(), True, 'main loop woken')
         if p.idle_for() > 1:
             raise AssertionError(f'idle_for {p.idle_for():.1f}s after input')
     finally:
