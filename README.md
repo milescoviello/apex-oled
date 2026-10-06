@@ -161,7 +161,9 @@ shows `loading` while a request waits for it to come back.
 
 A server that is simply off stays quiet. If one of `[qwen] clients` (default
 `omp`) is running while no server answers, its requests are failing. The
-panel then turns white and shows **MODEL DOWN**.
+panel then turns white and shows **MODEL DOWN** for two minutes. After that
+it gives the screen back, because a mostly-lit frame left up for hours would
+burn in.
 
 While the daemon runs, CLI writes route through it as expiring top-priority
 frames (`--notify SECS`, default 5). `--direct` bypasses it.

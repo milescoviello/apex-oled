@@ -83,8 +83,9 @@ backend = "auto"
 strata_url = "http://127.0.0.1:8099"
 # Programs that only make sense with a local model up. One of these running
 # while no server answers means its requests are failing, and the panel says
-# MODEL DOWN. Strata reloads a crashed engine on the next request by itself,
-# so this is what catches the server being gone. [] turns it off.
+# MODEL DOWN for two minutes (then it yields - an inverted frame left up for
+# hours would burn in). Strata reloads a crashed engine on the next request
+# by itself, so this is what catches the server being gone. [] turns it off.
 clients = ["omp"]
 
 # llama.cpp backend

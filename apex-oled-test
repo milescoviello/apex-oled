@@ -692,6 +692,25 @@ def t_qwen_backend_choice():
         oledd.process_running = real
 
 
+@check('MODEL DOWN interrupts, then yields so it cannot burn in')
+def t_qwen_alarm_hold():
+    import time
+    src = oledd.QwenSource(_qwen_ctx())
+    down = oledd.qwen_view(backend='strata', broken=True)
+    now = time.time()
+    src._set_view(down)
+    eq(src.active(now), True, 'fresh alarm takes the screen')
+    src._set_view(down)                 # still down on the next poll
+    eq(src.active(now + src.ALARM_HOLD - 1), True, 'held for ALARM_HOLD')
+    eq(src.active(now + src.ALARM_HOLD + 1), False, 'then yields')
+    if src.render(now + src.ALARM_HOLD + 1) is None:
+        raise AssertionError('still drawable when pinned')
+    # recovering and failing again is a new alarm
+    src._set_view(oledd.qwen_view(backend='strata', up=True, state='idle'))
+    src._set_view(down)
+    eq(src.active(time.time()), True, 'a new failure alarms again')
+
+
 @check('process_running finds programs by name, interpreters included')
 def t_process_running():
     with open('/proc/self/cmdline', 'rb') as f:

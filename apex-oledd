@@ -1274,6 +1274,11 @@ class QwenSource(Source):
     fps = 2.0
 
     GEN_FRESH = 10.0        # keep showing a finished turn for this long
+    # MODEL DOWN is an inverted frame - nearly every pixel lit - and with omp
+    # left open and Strata stopped it can stay true for hours, which is
+    # exactly the burn-in the rest of the daemon works to avoid. Interrupt
+    # for this long, then yield; pinning the view still shows it.
+    ALARM_HOLD = 120.0
     BUSY_POLL = 1.0
     # A dead server can stay dead for hours with omp left open, and each
     # check may run qwen-status and so nvidia-smi; a few seconds to notice it
@@ -1290,6 +1295,7 @@ class QwenSource(Source):
         self._backends = {b.name: b for b in (StrataBackend(ctx), LlamaBackend(ctx))}
         self._gen_seen = 0.0
         self._was_busy = False
+        self._broken_since = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -1328,6 +1334,10 @@ class QwenSource(Source):
         if self._was_busy and not busy:
             self._gen_seen = time.time()
         self._was_busy = busy
+        if not (view and view['broken']):
+            self._broken_since = None
+        elif self._broken_since is None:
+            self._broken_since = time.time()
         self._view = view
 
     def _loop(self):
@@ -1352,7 +1362,8 @@ class QwenSource(Source):
         if not v:
             return False
         if v['broken']:
-            return True                     # a dead server is worth interrupting for
+            # a dead server is worth interrupting for, but not indefinitely
+            return now - (self._broken_since or now) < self.ALARM_HOLD
         if not v['up']:
             return False                    # stack off: nothing to report
         if v['state'] in BUSY_STATES:
