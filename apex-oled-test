@@ -862,6 +862,39 @@ def t_compose_bounds():
         eq(out.size, (W, H), 'composed size')
 
 
+# --- input devices ---------------------------------------------------------
+
+def _fake_input(root, node, name, key='0', rel='0', abs_='0', props='0'):
+    """A /sys/class/input/eventN directory with just what the daemon reads.
+
+    Bitmaps are given exactly as the kernel prints them; the defaults in the
+    checks below were copied from real devices.
+    """
+    dev = os.path.join(root, node, 'device')
+    os.makedirs(os.path.join(dev, 'capabilities'))
+    for rel_path, text in (('name', name), ('properties', props),
+                           ('capabilities/key', key), ('capabilities/rel', rel),
+                           ('capabilities/abs', abs_)):
+        with open(os.path.join(dev, rel_path), 'w') as f:
+            f.write(text + '\n')
+    return os.path.join(root, node)
+
+
+@check('evdev_caps() reads unpadded sysfs bitmaps as one bit per code')
+def t_evdev_caps():
+    root = tempfile.mkdtemp()
+    # A touchpad: BTN_LEFT (272) in the fifth word, BTN_TOOL_FINGER (325) and
+    # BTN_TOUCH (330) in the sixth, every lower word printed as a bare "0".
+    pad = _fake_input(root, 'event5', 'Touchpad', key='e520 10000 0 0 0 0')
+    keys = oledd.evdev_caps(pad, 'capabilities/key')
+    for code in (272, 325, 330):
+        eq(keys >> code & 1, 1, f'code {code} set')
+    for code in (0, 30, 271, 273, 324):
+        eq(keys >> code & 1, 0, f'code {code} clear')
+    eq(oledd.evdev_caps(pad, 'capabilities/rel'), 0, 'empty bitmap')
+    eq(oledd.evdev_caps(pad, 'no/such/file'), 0, 'missing file reads as empty')
+
+
 # --- any script ------------------------------------------------------------
 
 @check('clusters keep marks, flags, skin tones and ZWJ sequences whole')

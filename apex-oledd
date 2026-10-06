@@ -1859,6 +1859,24 @@ class IdleSource(Source):
 # IPC
 # ---------------------------------------------------------------------------
 
+def evdev_caps(sysdir, what):
+    """An evdev node's sysfs bitmap as one int, so bit n is code n.
+
+    `what` is 'capabilities/key', 'capabilities/rel', 'properties' and so on.
+    The kernel writes 64-bit hex words, most significant first, without zero
+    padding ("30000 0 0 0 0"), so each word is padded back out before joining.
+    """
+    try:
+        with open(os.path.join(sysdir, 'device', what)) as f:
+            words = f.read().split()
+    except OSError:
+        return 0
+    try:
+        return int(''.join(w.zfill(16) for w in words) or '0', 16)
+    except ValueError:
+        return 0
+
+
 class Hotkeys(threading.Thread):
     """Watch the keyboard for <modifier>+<key> and drive the panel with it.
 
@@ -1911,15 +1929,11 @@ class Hotkeys(threading.Thread):
             try:
                 if 'Apex Pro Gen 3' not in open(sysdir + '/device/name').read():
                     continue
-                caps = open(sysdir + '/device/capabilities/key').read().split()
             except OSError:
                 continue
             node = '/dev/input/' + os.path.basename(sysdir)
             best = best or node
-            # capabilities/key is 64-bit words, most significant first
-            words = [int(w, 16) for w in reversed(caps)]
-            idx, bit = divmod(want_code, 64)
-            if idx < len(words) and words[idx] >> bit & 1:
+            if evdev_caps(sysdir, 'capabilities/key') >> want_code & 1:
                 return node
         return best
 
