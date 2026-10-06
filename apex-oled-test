@@ -895,6 +895,211 @@ def t_evdev_caps():
     eq(oledd.evdev_caps(pad, 'no/such/file'), 0, 'missing file reads as empty')
 
 
+# --- away from keyboard ----------------------------------------------------
+
+# (node, name, key, rel, abs, props, watched?) - bitmaps from a real machine.
+_DEVICES = [
+    ('event0', 'Lid Switch', '0', '0', '0', '0', False),
+    ('event1', 'Power Button', '8000 10000000000000 0', '0', '0', '0', False),
+    ('event3', 'AT Translated Set 2 keyboard',
+     '402000007 ff803078f800d001 feffffdfffcfffff fffffffffffffffe',
+     '0', '0', '0', True),
+    ('event5', 'GXTP5100:00 27C6:01E0 Touchpad', 'e520 10000 0 0 0 0', '0',
+     '2e0800000000003', '5', True),
+    ('event9', 'Video Bus', '3e000b00000000 0 0 0', '0', '0', '0', False),
+    ('event17', 'SteelSeries Aerox 9 Wireless', 'ff0000 0 0 0 0', '1943',
+     '10000000000', '0', True),
+    ('event22', 'sof-hda-dsp Headphone',
+     '40 0 0 0 0 0 0 1000000000 c000000000000 0', '0', '0', '0', False),
+    ('event26', 'SteelSeries Apex Pro Gen 3',
+     '1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe',
+     '0', '0', '0', True),
+    # Media keys only: taking the headphones off sends a pause, which must
+    # not count as sitting down at the desk.
+    ('event257', 'AirPods Max (AVRCP)',
+     '2fc800 145200000000 0 10300 49e800000c00 e16800000000f f810000010000ffc',
+     '0', '0', '0', False),
+    # Gamepad (BTN_SOUTH, 304) and its separate motion-sensor node.
+    ('event40', 'Xbox Wireless Controller', '7fdb000000000000 0 0 0 0',
+     '0', '3003f', '0', True),
+    ('event41', 'Controller Motion Sensors', '0', '0', '3f', '40', False),
+    ('event42', 'Pad With Sensors Built In', '7fdb000000000000 0 0 0 0',
+     '0', '3003f', '40', False),
+    # Synthetic input - matched by name against the default afk_ignore.
+    ('event12', 'ydotoold virtual device', 'ffffffffff 0 fffffffffffffffe',
+     '147', '0', '0', False),
+    ('event30', 'Mouse passthrough', 'ff0000 0 0 0 0', '1943', '0', '0', False),
+    ('event43', 'Sunshine X-Box One (virtual) pad', '7fdb000000000000 0 0 0 0',
+     '0', '3003f', '0', False),
+]
+
+
+def _fake_inputs(devices=_DEVICES):
+    sysfs, dev = tempfile.mkdtemp(), tempfile.mkdtemp()
+    for node, name, key, rel, abs_, props, _ in devices:
+        _fake_input(sysfs, node, name, key, rel, abs_, props)
+    return sysfs, dev
+
+
+def _ev(etype, code, value):
+    return oledd.Presence.EVENT.pack(0, 0, etype, code, value)
+
+
+SYN = _ev(0, 0, 0)
+
+
+@check('Presence watches keyboards, pointers and pads - not switches or synthetics')
+def t_presence_wanted():
+    sysfs, _ = _fake_inputs()
+    ignore = oledd.DEFAULTS['display']['afk_ignore']
+    for node, name, *_, want in _DEVICES:
+        got = oledd.Presence.wanted(os.path.join(sysfs, node), ignore) is not None
+        if got != want:
+            raise AssertionError(f'{name}: watched={got}, want {want}')
+    # The ignore list is what drops synthetics; without it they count.
+    eq(oledd.Presence.wanted(os.path.join(sysfs, 'event12')) is not None, True,
+       'ydotoold without an ignore list')
+
+
+@check('Presence counts presses and motion, not autorepeat or bookkeeping')
+def t_presence_is_input():
+    P = oledd.Presence
+    cases = [
+        ('key down', _ev(4, 4, 30) + _ev(1, 30, 1) + SYN, True),
+        ('key up', _ev(1, 30, 0) + SYN, True),
+        ('autorepeat only', _ev(1, 30, 2) + SYN + _ev(1, 30, 2) + SYN, False),
+        ('mouse motion', _ev(2, 0, -3) + _ev(2, 1, 1) + SYN, True),
+        ('stick or touch', _ev(3, 0, 1200) + SYN, True),
+        ('sync and scancodes only', SYN + _ev(4, 4, 30) + SYN, False),
+        ('empty read', b'', False),
+        ('trailing partial event', _ev(1, 30, 1) + b'\x00' * 7, True),
+    ]
+    for name, data, want in cases:
+        eq(P.is_input(data), want, name)
+
+
+@check('Presence scan opens wanted nodes once, and retries ones it could not open')
+def t_presence_scan():
+    import threading
+    sysfs, dev = _fake_inputs()
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    p = oledd.Presence(ctx, 5, oledd.DEFAULTS['display']['afk_ignore'])
+    p.SYSFS, p.DEV = sysfs, dev
+    try:
+        p.scan()
+        eq(p.fds, {}, 'no device nodes yet (unreadable)')
+        p.last_input -= 3600
+        eq(p.away(), False, 'nothing watched is never away')
+        # Regular files stand in for the /dev nodes; the hotplug case is a
+        # node that failed to open (udev had not set its group yet) and must
+        # be picked up on the next pass, not skipped forever.
+        for node, *_ in _DEVICES:
+            open(os.path.join(dev, node), 'w').close()
+        p.scan()
+        want = sorted(os.path.join(dev, n) for n, *_, w in _DEVICES if w)
+        eq(sorted(p.fds), want, 'watched nodes')
+        eq(p.away(), False, 'first devices restart the clock')
+        fds = dict(p.fds)
+        p.scan()
+        eq(p.fds, fds, 'a rescan does not reopen')
+    finally:
+        p.close()
+
+
+@check('Presence drops a node that hits EOF or an error (unplugged)')
+def t_presence_unplug():
+    import threading
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    p = oledd.Presence(ctx, 5)
+    r, w = os.pipe()
+    p.fds['/dev/input/event99'] = r
+    try:
+        os.write(w, _ev(1, 30, 1) + SYN)
+        eq(p.drain([r]), True, 'a keypress')
+        os.write(w, _ev(1, 30, 2) + SYN)
+        eq(p.drain([r]), False, 'autorepeat alone')
+        eq(p.drain([]), False, 'nothing ready')
+        os.close(w)
+        eq(p.drain([r]), False, 'EOF is not input')
+        eq(p.fds, {}, 'node dropped')
+    finally:
+        p.close()
+
+
+@check('Presence thread notices input on a watched fd')
+def t_presence_thread():
+    import threading
+    import time
+    ctx = _Ctx()
+    ctx.stop = threading.Event()
+    p = oledd.Presence(ctx, 1 / 60)         # one second
+    p.SYSFS = tempfile.mkdtemp()            # nothing real to find
+    r, w = os.pipe()
+    p.fds['/dev/input/event99'] = r
+    p.last_input -= 10
+    eq(p.away(), True, 'away before any input')
+    p.start()
+    try:
+        os.write(w, _ev(2, 0, 5) + SYN)
+        deadline = time.monotonic() + 3
+        while p.away() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        eq(p.away(), False, 'back after mouse motion')
+        if p.idle_for() > 1:
+            raise AssertionError(f'idle_for {p.idle_for():.1f}s after input')
+    finally:
+        ctx.stop.set()
+        p.join(3)
+        os.close(w)
+    eq(p.is_alive(), False, 'thread stops with the daemon')
+
+
+@check('should_blank: lock and manual are absolute, absence yields to notify')
+def t_should_blank():
+    import time
+
+    class _Sess:
+        def __init__(self, **kw): self.d = kw
+        def session(self): return self.d
+
+    class _Away:
+        def __init__(self, away): self._away = away
+        def away(self): return self._away
+
+    def why(locked=False, idle=False, away=None, notify=False, manual=False,
+            on_idle=False):
+        ctx = _Ctx()
+        ctx.cfg['display']['blank_on_idle'] = on_idle
+        ctx.s = _Sess(locked=locked, idle=idle)
+        ctx.blank_override = manual
+        ctx.presence = None if away is None else _Away(away)
+        ctx.notify = oledd.NotifySource(ctx)
+        if notify:
+            ctx.notify.push(Image.new('1', (W, H), 0), 5)
+        return oledd.Context.should_blank(ctx, time.time())
+
+    eq(why(), None, 'nothing to blank for')
+    eq(why(away=False), None, 'someone is here')
+    eq(why(away=True), 'away', 'nobody is here')
+    eq(why(away=True, notify=True), None, 'a pushed frame still shows')
+    eq(why(locked=True, away=True, notify=True), 'locked', 'lock beats notify')
+    eq(why(manual=True, notify=True), 'manual', 'manual beats notify')
+    eq(why(idle=True), None, 'IdleHint ignored unless blank_on_idle')
+    eq(why(idle=True, on_idle=True), 'idle', 'IdleHint with blank_on_idle')
+    eq(why(idle=True, on_idle=True, notify=True), None, 'idle yields to notify')
+
+
+@check('AFK blanking is on by default at five minutes')
+def t_afk_defaults():
+    cfg = oledd.load_config('/nonexistent')
+    eq(cfg['display']['afk_minutes'], 5, 'default timeout')
+    eq('ydotoold' in cfg['display']['afk_ignore'], True, 'synthetic input ignored')
+    # A bare string must be one pattern, not one per letter.
+    eq(oledd.Presence(_Ctx(), 5, 'ydotoold').ignore, ['ydotoold'], 'string ignore')
+
+
 # --- any script ------------------------------------------------------------
 
 @check('clusters keep marks, flags, skin tones and ZWJ sequences whole')

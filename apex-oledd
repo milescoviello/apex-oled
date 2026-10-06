@@ -19,7 +19,8 @@ Adding one is a subclass with active()/render(); see Source below.
 
 Burn-in: this is an OLED showing largely static content, so the whole frame is
 nudged around a small pixel-shift orbit, and the panel blanks when the session
-locks. Content is drawn inside a margin so the shift never clips it.
+locks or nobody has touched an input device for a few minutes. Content is
+drawn inside a margin so the shift never clips it.
 
 Config lives at ~/.config/apex-oled/config.toml; see DEFAULTS.
 """
@@ -71,6 +72,15 @@ DEFAULTS = {
     'display': {
         'blank_on_lock': True,
         'blank_on_idle': False,
+        # Blank after this many minutes without keyboard, mouse or gamepad
+        # input, read from evdev - see Presence. 0 disables.
+        'afk_minutes': 5,
+        # Input devices whose events do not mean anyone is at the keyboard,
+        # by case-insensitive substring of their name: ydotool (scripts and
+        # agents typing) and Sunshine's virtual keyboard, mice ("passthrough")
+        # and pads ("Sunshine ... (virtual) pad") - someone streaming from
+        # another screen.
+        'afk_ignore': ['ydotoold', 'passthrough', 'sunshine'],
         'burnin_shift': 2,
         'burnin_period': 611.0,
     },
@@ -1981,6 +1991,158 @@ class Hotkeys(threading.Thread):
             os.close(fd)
 
 
+class Presence(threading.Thread):
+    """Whether anyone is at the machine, judged from raw input.
+
+    The panel should go dark when nobody is looking, and the desktop cannot
+    say when that is here: KDE never sets logind's IdleHint, and
+    org.freedesktop.ScreenSaver.GetSessionIdleTime answers NotSupported on
+    Wayland. So read evdev directly, as the hotkeys do - but every keyboard,
+    mouse, touchpad, tablet and gamepad rather than just the Apex, so mousing
+    around or playing with a controller counts as being here. Needs the
+    `input` group; with no readable node it never reports anyone away.
+
+    Like the hotkeys this only observes. EVIOCGRAB would swallow the input.
+    Nodes are rescanned every few seconds for hotplug, and one that fails a
+    read (ENODEV once unplugged) is dropped until a rescan finds it again.
+    """
+    # Codes only a person-operated device reports: KEY_A, BTN_LEFT,
+    # BTN_JOYSTICK, BTN_GAMEPAD, BTN_TOOL_PEN, BTN_TOUCH. Power buttons, lid
+    # and jack switches, brightness keys and headphone media buttons have none.
+    PERSON_CODES = (30, 272, 288, 304, 320, 330)
+    # Motion sensors stream while a pad sits untouched on the desk, which
+    # would make nobody ever away. Most drivers give them their own buttonless
+    # node, which PERSON_CODES already skips; this catches one that doesn't.
+    PROP_ACCELEROMETER = 6
+    EV_KEY, EV_REL, EV_ABS = 1, 2, 3
+    EVENT = struct.Struct('qqHHi')      # struct input_event on 64-bit
+    SYSFS, DEV = '/sys/class/input', '/dev/input'
+    RESCAN = 5.0
+    # After seeing input, pause this long before looking again. A 1000 Hz
+    # mouse would otherwise wake this thread a thousand times a second to
+    # learn nothing new; the kernel buffers (and past its limit drops) events
+    # meanwhile, and only "something happened" matters here.
+    SETTLE = 0.5
+
+    def __init__(self, ctx, minutes, ignore=(), log=lambda m: None):
+        super().__init__(daemon=True)
+        self.ctx = ctx
+        self.timeout = minutes * 60.0
+        if isinstance(ignore, str):     # a bare string would ignore by letter
+            ignore = [ignore]
+        self.ignore = [str(s).lower() for s in ignore if str(s)]
+        self.log = log
+        self.fds = {}                   # /dev/input node -> fd
+        # Monotonic, so a wall-clock jump cannot blank or unblank the panel.
+        self.last_input = time.monotonic()
+
+    def idle_for(self):
+        return time.monotonic() - self.last_input
+
+    def away(self):
+        """Nothing touched for the timeout. Never while nothing is watched:
+        no readable device is no evidence of absence."""
+        return bool(self.fds) and self.idle_for() >= self.timeout
+
+    @classmethod
+    def wanted(cls, sysdir, ignore=()):
+        """The device name if a person operates this node, else None."""
+        try:
+            with open(os.path.join(sysdir, 'device', 'name')) as f:
+                name = f.read().strip()
+        except OSError:
+            return None
+        if any(s in name.lower() for s in ignore):
+            return None
+        if evdev_caps(sysdir, 'properties') >> cls.PROP_ACCELEROMETER & 1:
+            return None
+        keys = evdev_caps(sysdir, 'capabilities/key')
+        if (any(keys >> c & 1 for c in cls.PERSON_CODES)
+                or evdev_caps(sysdir, 'capabilities/rel') & 1):     # REL_X
+            return name
+        return None
+
+    @classmethod
+    def is_input(cls, data):
+        """Whether a read holds something a person did: a key going down or
+        up, or any motion. Autorepeat (value 2) is the kernel's doing - a book
+        resting on the keyboard is not someone typing. SYN and MSC events
+        only ever accompany the real ones."""
+        whole = len(data) - len(data) % cls.EVENT.size
+        for _, _, etype, _, value in cls.EVENT.iter_unpack(data[:whole]):
+            if etype in (cls.EV_REL, cls.EV_ABS) or (
+                    etype == cls.EV_KEY and value != 2):
+                return True
+        return False
+
+    def scan(self):
+        """Open every wanted node that is not already watched."""
+        had = bool(self.fds)
+        for sysdir in sorted(glob.glob(os.path.join(self.SYSFS, 'event*'))):
+            node = os.path.join(self.DEV, os.path.basename(sysdir))
+            if node in self.fds:
+                continue
+            name = self.wanted(sysdir, self.ignore)
+            if name is None:
+                continue
+            try:
+                self.fds[node] = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue            # not in `input`, or unplugged mid-scan
+            self.log(f'afk: watching {node} ({name})')
+        if self.fds and not had:
+            # Nothing to judge by until now, so start the clock here rather
+            # than blanking at once on a stale timestamp.
+            self.last_input = time.monotonic()
+
+    def drain(self, ready):
+        """Read every ready fd; True if any of it was a person."""
+        hit = False
+        for node, fd in list(self.fds.items()):
+            if fd not in ready:
+                continue
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError:
+                data = b''
+            if not data:
+                os.close(fd)
+                del self.fds[node]
+                self.log(f'afk: lost {node}')
+                continue
+            hit = self.is_input(data) or hit
+        return hit
+
+    def run(self):
+        self.scan()
+        if not self.fds:
+            self.log('afk: no readable input device, so the panel never blanks '
+                     'for absence - is this user in the `input` group?')
+        rescan = time.monotonic() + self.RESCAN
+        while not self.ctx.stop.is_set():
+            if time.monotonic() >= rescan:
+                self.scan()
+                rescan = time.monotonic() + self.RESCAN
+            if not self.fds:
+                self.ctx.stop.wait(self.RESCAN)
+                continue
+            ready, _, _ = select.select(list(self.fds.values()), [], [], 1.0)
+            if self.drain(ready):
+                self.last_input = time.monotonic()
+                self.ctx.stop.wait(self.SETTLE)
+        self.close()
+
+    def close(self):
+        for fd in self.fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
+
+
 class Server(threading.Thread):
     """Unix socket accepting JSON commands, one per connection.
 
@@ -2083,9 +2245,16 @@ class Server(threading.Thread):
                     'blanked': self.ctx.blank_override}
         if cmd == 'status':
             now = time.time()
+            pres = self.ctx.presence
             return {'ok': True, 'source': self.ctx.current_source,
                     'sources': [s.name for s in self.ctx.sources if s.active(now)],
                     'blanked': self.ctx.blanked,
+                    'blank_reason': self.ctx.blank_reason,
+                    # Absence detection: seconds since the last input on any
+                    # of `watching` devices, against a timeout of `afk_after`.
+                    'afk': pres and {'idle_for': round(pres.idle_for(), 1),
+                                     'afk_after': pres.timeout,
+                                     'watching': len(pres.fds)},
                     'device_error': self.ctx.device_error,
                     'forced_mode': self.ctx.forced_mode}
         return {'ok': False, 'error': f'unknown command: {cmd!r}'}
@@ -2105,6 +2274,8 @@ class Context:
         self.stop = threading.Event()
         self.current_source = None
         self.blanked = False
+        self.blank_reason = None    # while blanked: what should_blank() said
+        self.presence = None        # Presence, unless afk_minutes is 0
         self.device_error = None    # set while the panel cannot be opened
         self.forced_mode = None     # source name pinned by a hotkey, or None
         self.blank_override = False
@@ -2132,15 +2303,33 @@ class Context:
             y += lh
         return img
 
-    def should_blank(self):
+    def should_blank(self, now=None):
+        """Why the panel should be dark - 'manual', 'locked', 'idle' or
+        'away' - or None to draw as normal.
+
+        Manual and locked are absolute. The two absence reasons give way to a
+        frame pushed over the socket: it was asked for explicitly and expires
+        on its own, and then the panel goes dark again - a notification does
+        not count as someone being here.
+
+        'idle' is logind's IdleHint, which GNOME sets and KDE never does;
+        'away' is evdev input via Presence, which works anywhere the user is
+        in the `input` group. Either is enough.
+        """
         if self.blank_override:
-            return True
+            return 'manual'
         d, sess = self.cfg['display'], self.s.session()
         if d.get('blank_on_lock', True) and sess.get('locked'):
-            return True
+            return 'locked'
+        why = None
         if d.get('blank_on_idle', False) and sess.get('idle'):
-            return True
-        return False
+            why = 'idle'
+        elif self.presence is not None and self.presence.away():
+            why = 'away'
+        if why and self.notify is not None and self.notify.active(
+                time.time() if now is None else now):
+            return None
+        return why
 
 
 def compose(frame, now, cfg):
@@ -2252,6 +2441,16 @@ def run(args):
         else:
             log('hotkeys: nothing bound')
 
+    try:
+        afk = float(cfg['display'].get('afk_minutes') or 0)
+    except (TypeError, ValueError):
+        afk = DEFAULTS['display']['afk_minutes']
+    if afk > 0:
+        ctx.presence = Presence(ctx, afk, cfg['display'].get('afk_ignore') or (),
+                                log)
+        ctx.presence.start()
+        log(f'afk: blanking after {afk:g} min without input')
+
     dpy, last_fb = None, None
     fails, since = 0, 0.0
     while not ctx.stop.is_set():
@@ -2290,15 +2489,19 @@ def run(args):
                 if not fails:
                     log(f'opened {dpy.path}')
 
-            if ctx.should_blank():
+            why = ctx.should_blank(now)
+            if why:
                 if not ctx.blanked:
                     dpy.blank()
                     healthy()
                     last_fb, ctx.blanked = None, True
-                    log('blanked (session locked/idle)')
+                    log(f'blanked ({why})')
+                ctx.blank_reason = why
                 ctx.stop.wait(1.0)
                 continue
-            ctx.blanked = False
+            if ctx.blanked:
+                log('unblanked')
+            ctx.blanked, ctx.blank_reason = False, None
 
             # notify always wins (it is the hotkey's own confirmation), then a
             # mode pinned by a hotkey, then normal arbitration.
