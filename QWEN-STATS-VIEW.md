@@ -1,5 +1,12 @@
 # Task: add a "local AI stats" view to the Apex OLED
 
+> **Since then:** the local model moved to Qwen3.8-Flash-Next on Strata
+> (`flashnext-serve`, :8099), and omp talks to it directly. `StrataBackend` reads
+> the same stats from Strata's `/metrics` and `/health`. The `qwen-status`
+> contract below still drives the llama.cpp stack (`LlamaBackend`). There is no
+> proxy any more, so MODEL DOWN now means an omp process is running while no
+> server answers (`[qwen] clients`). See the README's "The local-LLM view".
+
 Add a new display source showing live stats for the local Qwen3.8-27B inference stack
 (llama.cpp on the RTX 5090). The interesting thing to surface is **prefill progress** —
 a large session can take 5+ minutes to process its prompt before emitting a single

@@ -122,7 +122,7 @@ producers don't race to be the last writer:
 | `notify` | 100 | transient frames pushed by the CLI over a unix socket |
 | `game` | 30 | live **FPS** (via MangoHud), GPU/CPU load and temps, **swap in/out**, while gamemode runs or MangoHud is logging |
 | `video` | 28 | packed frames synced to a matching now-playing track |
-| `qwen` | 25 | local llama.cpp prefill progress, live decode rate, context bar |
+| `qwen` | 25 | local LLM (Strata or llama.cpp) prefill progress, live decode rate, context bar |
 | `lyrics` | 20 | current synced lyric, else a now-playing card |
 | `idle` | 0 | RAM/VRAM capacity bars over CPU and GPU rows |
 
@@ -145,6 +145,23 @@ log_interval=500
 folder and prunes logs older than two days. While logging, MangoHud draws a
 small dot in its overlay's corner. Games without MangoHud keep the no-FPS
 layout.
+
+### The local-LLM view
+
+A big prompt can take minutes to prefill before the first token, and that
+looks the same as a hang. This view shows the prefill's progress, rate and
+ETA, then the live decode rate, GPU, and how full the context window is. It
+takes the screen only while a turn is running and for a few seconds after.
+
+It reads [Strata](https://github.com/Niko1221/Strata) (`flashnext-serve`,
+which omp talks to) from its `/metrics` and `/health`, or llama-server
+through `qwen-status --json` and `/slots`. `[qwen] backend = "auto"` uses
+whichever is up. Strata unloads the model after a quiet spell, and the panel
+shows `loading` while a request waits for it to come back.
+
+A server that is simply off stays quiet. If one of `[qwen] clients` (default
+`omp`) is running while no server answers, its requests are failing. The
+panel then turns white and shows **MODEL DOWN**.
 
 While the daemon runs, CLI writes route through it as expiring top-priority
 frames (`--notify SECS`, default 5). `--direct` bypasses it.
