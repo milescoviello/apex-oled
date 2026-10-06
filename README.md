@@ -182,6 +182,16 @@ desktop shortcut editors generally do not - but it can only *observe* the
 keyboard, so the bound key still reaches the focused window. A compositor
 shortcut running the commands above is the only way to actually swallow it.
 
+The panel goes dark when the session locks, and after `afk_minutes` (default
+5) without keyboard, mouse, touchpad or gamepad input; the first keypress
+lights it again. KDE never marks the session idle in logind and won't tell a
+Wayland client how long it has been idle, so this reads evdev directly -
+every device a person operates, not just the Apex, observed and never
+grabbed - which needs the `input` group. Synthetic input (ydotool, Sunshine
+streaming) is ignored by name via `afk_ignore`. A CLI notification still
+shows while away, then the panel goes dark again. `apex-oled info` shows the
+countdown.
+
 Adding a source is a subclass with `active()` and `render()`:
 
 ```python
@@ -262,7 +272,9 @@ Things learned the hard way on a 128×40 one-bit panel:
   rolling scan, so writing faster than the scan just overwrites rows midway
   through being drawn. 30 fps is plenty.
 - **Burn-in is real.** The frame walks a slow ±2px orbit and the panel blanks
-  when the session locks.
+  when the session locks or nobody has touched an input device for five
+  minutes. The desktop is no help with the second: logind's IdleHint stays
+  `no` forever under KDE, so absence is read from evdev.
 
 `apex-oledd --preview out.png` renders one frame to a 4× PNG without touching
 the panel — that's how to iterate on layout without squinting at a keyboard.
@@ -270,13 +282,16 @@ the panel — that's how to iterate on layout without squinting at a keyboard.
 ## Tests
 
 ```bash
-apex-oled-test          # 28 checks, no keyboard required
+apex-oled-test          # 52 checks, no keyboard required
 ```
 
 Covers the packing against a slow reference implementation, a pack/unpack
 round trip, balanced wrapping, truncation, bar edge cases, Otsu on dark and
 bright histograms, source activation and gating, hotkey binding and actions,
-the live decode rate, and config fallback.
+the live decode rate, away-from-keyboard detection (which devices count,
+which events count, hotplug and unplug, against a fake sysfs and pipes rather
+than real `/dev/input`), what wins when blanking reasons overlap, and config
+fallback.
 
 ## Prior art
 

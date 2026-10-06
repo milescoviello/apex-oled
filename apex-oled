@@ -786,13 +786,26 @@ def cmd_info(sink, args):
         print(f'daemon      : running, but CANNOT REACH THE PANEL')
         print(f'              {status["device_error"]}')
     elif status:
+        why = status.get('blank_reason')
+        blanked = f' (blanked: {why})' if why else ' (blanked)'
         print(f'daemon      : running, showing {status.get("source")!r}'
-              f'{" (blanked)" if status.get("blanked") else ""}')
+              f'{blanked if status.get("blanked") else ""}')
         if status.get('forced_mode'):
             print(f'              PINNED to {status["forced_mode"]!r} - nothing '
                   f'else can take the screen')
             print("              release with: apex-oled mode auto")
         print(f'              active sources: {", ".join(status.get("sources", []))}')
+        if 'afk' in status:             # absent from daemons that predate it
+            afk = status['afk']
+            if not afk:
+                print('              afk blanking off (afk_minutes = 0)')
+            elif not afk.get('watching'):
+                print('              afk: never blanks - no readable input device '
+                      '(not in the input group?)')
+            else:
+                print(f'              afk: dark after {afk["afk_after"] / 60:g} min '
+                      f'without input; last input {afk["idle_for"]:.0f}s ago '
+                      f'({afk["watching"]} devices)')
         print('              CLI frames route through it; --direct to bypass')
     else:
         print('daemon      : not running (CLI writes straight to the panel)')

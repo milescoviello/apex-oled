@@ -1104,6 +1104,17 @@ def t_afk_defaults():
     eq(oledd.Presence(_Ctx(), 5, 'ydotoold').ignore, ['ydotoold'], 'string ignore')
 
 
+@check('every section in config.example.toml matches DEFAULTS')
+def t_config_example():
+    import tomllib
+    with open(os.path.join(_HERE, 'config.example.toml'), 'rb') as f:
+        example = tomllib.load(f)
+    # Its header promises "everything here matches the built-in defaults";
+    # a section may be left out, but one that is there must be whole.
+    for section, values in example.items():
+        eq(values, oledd.DEFAULTS.get(section), f'[{section}]')
+
+
 # --- any script ------------------------------------------------------------
 
 @check('clusters keep marks, flags, skin tones and ZWJ sequences whole')
