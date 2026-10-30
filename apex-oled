@@ -64,7 +64,8 @@ _FRAMES = {642: (b'\x61', b'\x00'),
 _DESC_PREFIX = bytes([0x06, 0xC0, 0xFF])
 _F2_FEATURE = bytes([0x09, 0xF2, 0x96])
 
-FONT_DIRS = ['/usr/share/fonts/dejavu']
+FONT_DIRS = ['/usr/share/fonts/dejavu',   # Gentoo
+             '/usr/share/fonts/TTF']      # Arch
 
 
 def _ioc(direction, typ, nr, size):
