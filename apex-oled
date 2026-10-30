@@ -43,16 +43,26 @@ from PIL import Image, ImageDraw, ImageFont, features
 SOCKET_PATH = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'),
                            'apex-oledd.sock')
 
-VENDOR, PRODUCT = 0x1038, 0x1640
+VENDOR = 0x1038
+PRODUCTS = (0x1640, 0x1642)  # Apex Pro Gen 3 full-size, Gen 3 TKL
 WIDTH, HEIGHT = 128, 40
 PAGES = HEIGHT // 8
 FB_LEN = WIDTH * PAGES              # 640
-CMD = 0x61
+# Framing inside the feature report (after the leading hidraw report-number
+# byte), keyed by the feature report length the device's HID descriptor
+# declares. Full-size Gen 3 (642) wants a 0x61 header + trailing 0x00.
+# TKL Gen 3 (644) uses the persistent-write framing validated on real
+# hardware 2026-10-30: header 38 83 00 00, no trailing byte, 640-byte
+# page-major framebuffer between (matches OmniLED's validated devices.lua
+# entry for 1038:1642). An earlier guess of 1F 81 was accepted by the
+# device but never changed the panel.
+_FRAMES = {642: (b'\x61', b'\x00'),
+           644: (b'\x38\x83\x00\x00', b'')}
 
-# Signature of the right interface: vendor page 0xFFC0 + a 642-byte feature
-# report (usage 0xF2, Report Count 0x0282).
+# Signature of the right interface: vendor page 0xFFC0 + a usage-0xF2
+# feature report (items: 09 f2 / count 96 <lo> <hi> / feature b1 02).
 _DESC_PREFIX = bytes([0x06, 0xC0, 0xFF])
-_DESC_FEATURE = bytes([0x09, 0xF2, 0x96, 0x82, 0x02, 0xB1, 0x02])
+_F2_FEATURE = bytes([0x09, 0xF2, 0x96])
 
 FONT_DIRS = ['/usr/share/fonts/dejavu']
 
@@ -65,8 +75,28 @@ def _hidiocsfeature(size):
     return _ioc(3, ord('H'), 0x06, size)
 
 
+def _feature_len(desc):
+    """Byte length of the vendor F2 feature report, or None if absent."""
+    if not desc.startswith(_DESC_PREFIX):
+        return None
+    i = desc.find(_F2_FEATURE)
+    if i < 0 or desc[i + 5:i + 7] != b'\xb1\x02':
+        return None
+    return desc[i + 3] | (desc[i + 4] << 8)
+
+
+def _descriptor(path):
+    try:
+        with open('/sys/class/hidraw/' + os.path.basename(path) +
+                  '/device/report_descriptor', 'rb') as f:
+            return f.read()
+    except OSError:
+        return b''
+
+
 def find_device():
-    """Path of the hidraw node that carries the framebuffer, or None."""
+    """(hidraw node, feature report length) for the interface carrying the
+    framebuffer, or (None, None)."""
     for sysdir in sorted(glob.glob('/sys/class/hidraw/hidraw*')):
         try:
             with open(sysdir + '/device/uevent') as f:
@@ -75,11 +105,12 @@ def find_device():
                 desc = f.read()
         except OSError:
             continue
-        if f'HID_ID=0003:{VENDOR:08X}:{PRODUCT:08X}' not in uevent.upper():
+        if not any(f'HID_ID=0003:{VENDOR:08X}:{p:08X}' in uevent.upper()
+                   for p in PRODUCTS):
             continue
-        if desc.startswith(_DESC_PREFIX) and _DESC_FEATURE in desc:
-            return '/dev/' + os.path.basename(sysdir)
-    return None
+        if _feature_len(desc) in _FRAMES:
+            return '/dev/' + os.path.basename(sysdir), _feature_len(desc)
+    return None, None
 
 
 _BITREV = bytes(int(format(i, '08b')[::-1], 2) for i in range(256))
@@ -521,8 +552,11 @@ class Display:
     """The keyboard's OLED panel."""
 
     def __init__(self, path=None):
-        self.path = path or find_device()
-        if self.path is None:
+        if path:
+            self.path, self.n = path, _feature_len(_descriptor(path))
+        else:
+            self.path, self.n = find_device()
+        if self.path is None or self.n not in _FRAMES:
             raise RuntimeError(
                 'No Apex Pro Gen 3 OLED interface found - is the keyboard connected?')
         try:
@@ -536,7 +570,8 @@ class Display:
         """Push a raw 640-byte page-major framebuffer."""
         if len(framebuffer) != FB_LEN:
             raise ValueError(f'framebuffer must be {FB_LEN} bytes, got {len(framebuffer)}')
-        buf = bytearray(b'\x00' + bytes([CMD]) + framebuffer + b'\x00')
+        head, tail = _FRAMES[self.n]
+        buf = bytearray(b'\x00' + head + framebuffer + tail)
         fcntl.ioctl(self.fd, _hidiocsfeature(len(buf)), buf)
 
     def show(self, img, invert=False):
@@ -774,9 +809,11 @@ def cmd_play(sink, args):
 def cmd_info(sink, args):
     font, scalable = load_font(13)
     status = daemon_send({'cmd': 'status'})
-    print(f'device      : {sink.dpy.path if sink.dpy else find_device()}')
+    path, feat_len = (sink.dpy.path, sink.dpy.n) if sink.dpy else find_device()
+    print(f'device      : {path}')
     print(f'panel       : {WIDTH}x{HEIGHT}, 1bpp, page-major (SSD1306 order)')
-    print(f'report      : {FB_LEN + 2}-byte feature report, cmd 0x{CMD:02X}')
+    print(f'report      : {feat_len}-byte feature report, header '
+          f'{_FRAMES[feat_len][0].hex().upper() if feat_len in _FRAMES else "?"}')
     print(f'truetype    : {"yes" if scalable else "NO - Pillow lacks freetype; "
                            "run: euse -E truetype && emerge -1 dev-python/pillow"}')
     print(f'shaping     : {"raqm " + (features.version("raqm") or "") if RAQM else "none - Arabic unjoined, Indic marks misplaced; Pillow needs USE=raqm"}')
