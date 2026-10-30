@@ -18,10 +18,12 @@ Pillow talking to `/dev/hidrawN`.
 This is the part worth reading if you're here to port it somewhere else.
 
 The keyboard exposes five HID interfaces. **Interface 1** (vendor usage page
-`0xFFC0`) declares a 642-byte *feature* report — that's the screen:
+`0xFFC0`) declares a *feature* report — that's the screen. Its size and
+framing differ by generation:
 
 ```
-642 bytes = [0x61] + 640-byte framebuffer + [0x00]
+full size  642 bytes = [0x61]            + 640-byte framebuffer + [0x00]
+TKL Gen 3  644 bytes = [0x38 0x83 0x00 0x00] + 640-byte framebuffer
 ```
 
 640 bytes is 128×40 pixels at 1 bit each. The framebuffer is in SSD1306
@@ -47,13 +49,18 @@ hardcoding `hidrawN` — the number moves across replugs:
 
 ```
 06 c0 ff          Usage Page (Vendor 0xFFC0)
-  09 f2 96 82 02  Usage 0xF2, Report Count 0x0282   ← 642 bytes
+  09 f2 96 82 02  Usage 0xF2, Report Count 0x0282   ← 642 bytes (full size)
+  09 f2 96 84 02  Usage 0xF2, Report Count 0x0284   ← 644 bytes (TKL)
   b1 02           Feature
 ```
 
-Verified on `1038:1640` (Apex Pro Gen 3, wired, full size). The Gen 3 TKL is
-`1038:1642` and prior art suggests the same framing; other Apex models use a
-`0x61` header with a 641-byte report.
+Verified on `1038:1640` (Apex Pro Gen 3, wired, full size) and on
+`1038:1642` (Apex Pro TKL Gen 3, wired). The TKL framing was taken from
+OmniLED's validated `devices.lua` entry for that PID (interface 1, prepend
+`38 83 00 00`) and then confirmed live: fill, checkerboard, and text frames
+observed on the panel, and the `0x82` output report verified to return the
+panel to the firmware screen. The TKL write is *persistent*: unlike the
+full size's transient write, the image stays until overwritten or reset.
 
 ## Install
 
