@@ -467,6 +467,11 @@ class Sensors:
     result is cached. loginctl and gamemoded ride along on the same thread.
     """
     SLOW_INTERVAL = 5.0
+    # nvidia-smi is itself a GPU client: every call restarts the driver's idle
+    # timer, and RTD3 needs ~15-20 s with no clients before it powers the card
+    # off. Polling an idle-but-awake card every SLOW_INTERVAL kept it awake
+    # forever (2026-11-02). While it looks idle, poll this rarely instead.
+    GPU_IDLE_INTERVAL = 60.0
 
     def __init__(self):
         self._cpu_temp_path = None
@@ -475,6 +480,7 @@ class Sensors:
         self._last_cpu = None
         self._last_swap = None
         self._gpu = {}
+        self._gpu_polled = None     # monotonic time of the last nvidia-smi, None = GPU was off
         self._session = {}
         self._gamemode = False
         self._resolve()
@@ -636,7 +642,17 @@ class Sensors:
     def _poll_gpu(self):
         if not self.gpu_awake():
             self._gpu = {}
+            self._gpu_polled = None
             return
+        # Poll at SLOW_INTERVAL only while the card is busy (last sample showed
+        # load, or a game is running) or it has just woken up; otherwise back
+        # off so RTD3 can power it down between samples.
+        now = time.monotonic()
+        busy = self._gpu.get('util', 0) > 0 or self._gamemode
+        if (self._gpu_polled is not None and not busy
+                and now - self._gpu_polled < self.GPU_IDLE_INTERVAL):
+            return
+        self._gpu_polled = now
         try:
             out = subprocess.run(
                 ['nvidia-smi', '--query-gpu=temperature.gpu,power.draw,'
