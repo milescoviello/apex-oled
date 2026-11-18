@@ -1,5 +1,7 @@
 # apex-oled
 
+> **This has moved to [steelmc](https://github.com/milescoviello/steelmc)**, which has everything here and more. This repo is archived.
+
 Drive the 128×40 OLED on a **SteelSeries Apex Pro Gen 3** keyboard from Linux.
 
 No SteelSeries GG, no hidapi, no kernel module, no root. Just Python and
